@@ -70,6 +70,57 @@ jobs:
             borealis/library/lib/swkbd.cpp
           grep -n "StringLenMax" borealis/library/lib/swkbd.cpp
 
+      - name: 4c. 让左摇杆也能控制上下左右导航
+        # borealis(master) 默认只把十字键映射成导航，左摇杆完全不处理
+        # （源码里有一行 TODO: Translate axis events to dpad events here）。
+        # 这里把左摇杆补成「带死区 + 长按重复」的导航输入。
+        run: |
+          set -e
+          python3 - <<'PY'
+          p = "borealis/library/lib/application.cpp"
+          s = open(p).read()
+          anchor = "    // TODO: Translate axis events to dpad events here\n"
+          assert anchor in s, "anchor not found in " + p
+          code = anchor + '''
+              // --- nx-downloader: 左摇杆 -> 上下左右导航 ---
+              {
+                  static int stickDir = -1;
+                  static retro_time_t stickLast = 0;
+                  const float ax = Application::gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_X];
+                  const float ay = Application::gamepad.axes[GLFW_GAMEPAD_AXIS_LEFT_Y];
+                  const float dead = 0.5f;
+                  int dir = -1;
+                  if (ay < -dead)      dir = 0; // UP
+                  else if (ay > dead)  dir = 1; // DOWN
+                  else if (ax < -dead) dir = 2; // LEFT
+                  else if (ax > dead)  dir = 3; // RIGHT
+                  retro_time_t now = cpu_features_get_time_usec();
+                  if (Application::blockInputsTokens == 0 && dir != -1)
+                  {
+                      if (dir != stickDir)
+                      {
+                          stickDir = dir;
+                          stickLast = now;
+                          Application::navigate((FocusDirection)dir);
+                      }
+                      else if (now - stickLast >= 180000)
+                      {
+                          stickLast = now;
+                          Application::navigate((FocusDirection)dir);
+                      }
+                      else
+                          stickLast = now;
+                  }
+                  else if (dir == -1)
+                      stickDir = -1;
+              }
+          '''
+          s = s.replace(anchor, code, 1)
+          open(p, "w").write(s)
+          print("patched application.cpp: 左摇杆导航已加入")
+          PY
+          grep -n "左摇杆 -> 上下左右导航" borealis/library/lib/application.cpp
+
       - name: 5. 同步 borealis 运行时资源
         run: |
           set -e
