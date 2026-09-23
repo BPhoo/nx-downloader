@@ -14,21 +14,23 @@ PathPickerView::PathPickerView(const std::string& startPath, std::function<void(
     if (!fsx::isDirectory(this->currentPath))
         this->currentPath = "sdmc:/";
 
-    // B 键返回上一屏
-    this->registerAction("返回", Key::B, [] {
+    // B 键返回上一屏：交给 Application 把本视图弹出，焦点会自动交还给主界面
+    this->registerAction("返回", Key::B, [this] {
         Application::popView();
         return true;
     });
 
+    // 此时本视图尚未入栈：rebuild 内部不会去抢主界面的焦点
     this->rebuild();
 }
 
 PathPickerView::~PathPickerView() = default;
 
-void PathPickerView::requestNavigate(const std::string& path)
+void PathPickerView::willAppear(bool resetState)
 {
-    // 只记录目标，真正的重建放到下一帧的 draw() 里做
-    this->pendingPath = fsx::normalize(path);
+    List::willAppear(resetState);
+    // 入栈完成，之后 rebuild（切换目录）时才可以安全地重新给焦点
+    this->onStack = true;
 }
 
 void PathPickerView::confirmCurrent()
@@ -42,9 +44,6 @@ void PathPickerView::confirmCurrent()
 
 void PathPickerView::rebuild()
 {
-    // 先把焦点摘掉，避免删掉当前被聚焦的列表项
-    Application::giveFocus(nullptr);
-
     this->clear(true);
 
     this->addView(new Header("选择下载目录", true, this->currentPath));
@@ -56,14 +55,14 @@ void PathPickerView::rebuild()
     });
     this->addView(useItem);
 
-    // 上级目录
+    // 上一级目录
     if (this->currentPath != "sdmc:/")
     {
         std::string parentPath = fsx::parent(this->currentPath);
         ListItem* upItem       = new ListItem("上一级目录", parentPath);
         upItem->setValue("进入");
         upItem->getClickEvent()->subscribe([this, parentPath](View*) {
-            this->requestNavigate(parentPath);
+            this->navigateTo(parentPath);
         });
         this->addView(upItem);
     }
@@ -86,24 +85,23 @@ void PathPickerView::rebuild()
             ListItem* item = new ListItem(name);
             item->setValue("进入");
             item->getClickEvent()->subscribe([this, childPath](View*) {
-                this->requestNavigate(childPath);
+                this->navigateTo(childPath);
             });
             this->addView(item);
         }
     }
 
-    // 重建完成后重新给焦点（默认落在「使用此目录」上）
-    Application::giveFocus(this->getDefaultFocus());
+    // 只有本视图已经在视图栈上时才重新给焦点。
+    // 构造函数阶段（尚未入栈）不要碰焦点，否则会把「主界面当前焦点」错误地
+    // 存进 focusStack，导致返回主界面后焦点悬空、所有按键失灵。
+    // 注意：删除正被聚焦的子项时，borealis 会自动把全局焦点清空，因此这里
+    // 重新聚焦是安全的。
+    if (this->onStack)
+        Application::giveFocus(useItem);
 }
 
-void PathPickerView::draw(NVGcontext* vg, int x, int y, unsigned width, unsigned height, Style* style, FrameContext* ctx)
+void PathPickerView::navigateTo(const std::string& path)
 {
-    if (!this->pendingPath.empty())
-    {
-        this->currentPath = this->pendingPath;
-        this->pendingPath.clear();
-        this->rebuild();
-    }
-
-    List::draw(vg, x, y, width, height, style, ctx);
+    this->currentPath = fsx::normalize(path);
+    this->rebuild();
 }

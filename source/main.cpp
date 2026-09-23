@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <curl/curl.h>
 
@@ -26,6 +27,31 @@
 
 namespace i18n = brls::i18n;
 using namespace i18n::literals;
+
+/// 初始化网络（BSD socket 服务）
+///
+/// 为什么不直接用 socketInitializeDefault()：
+///   从「相册」启动时是 Applet 模式，可用内存远小于完整应用模式，
+///   socketInitializeDefault() 默认的缓冲配置可能申请失败而返回非 0。
+///   这里先用默认配置，失败再退回到一份较小的配置重试一次。
+static bool initNetwork()
+{
+    if (R_SUCCEEDED(socketInitializeDefault()))
+        return true;
+
+    SocketInitConfig cfg;
+    std::memset(&cfg, 0, sizeof(cfg));
+    cfg.bsdsockets_version   = 1;
+    cfg.tcp_tx_buf_size      = 0x8000;
+    cfg.tcp_rx_buf_size      = 0x10000;
+    cfg.tcp_tx_buf_max_size  = 0x40000;
+    cfg.tcp_rx_buf_max_size  = 0x40000;
+    cfg.udp_tx_buf_size      = 0x2400;
+    cfg.udp_rx_buf_size      = 0x4000;
+    cfg.sb_efficiency        = 4;
+
+    return R_SUCCEEDED(socketInitialize(&cfg));
+}
 
 // 全局下载器：生命周期与进程一致。
 // 这样即使界面（MainView）已经被销毁，工作线程也一定能被安全地 join 掉。
@@ -116,7 +142,7 @@ int main(int argc, char* argv[])
     //------------------------------------------------------------------
     // 2. 网络（libcurl 需要先初始化 socket 驱动）
     //------------------------------------------------------------------
-    const bool socketOk = R_SUCCEEDED(socketInitializeDefault());
+    const bool socketOk = initNetwork();
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
@@ -157,7 +183,7 @@ int main(int argc, char* argv[])
     }
 
     if (!socketOk)
-        brls::Application::notify("网络初始化失败，下载可能不可用");
+        brls::Application::notify("网络初始化失败：下载功能不可用。请确认已连接 Wi-Fi；若从相册启动仍失败，可按住 R 键从游戏图标以完整内存模式启动");
 
     //------------------------------------------------------------------
     // 5. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
