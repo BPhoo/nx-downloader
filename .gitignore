@@ -1,0 +1,10 @@
+# borealis 是外部依赖，由 CI 里的 git clone 拉取，不进仓库
+borealis/
+
+# 构建产物（.nro 由 GitHub Actions 生成并从 Artifacts 下载）
+build/
+*.elf
+*.nacp
+*.nro
+*.map
+*.d

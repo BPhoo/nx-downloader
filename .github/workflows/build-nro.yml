@@ -1,0 +1,69 @@
+# NX Downloader —— 在 GitHub 的服务器上编译，产出 nx-downloader.nro
+#
+# 为什么这么做：
+#   devkitPro 的包服务器 pkg.devkitpro.org 挂在 Cloudflare 后面，
+#   部分地区（含中国大陆很多宽带出口）会被整站 403，导致本机装不上工具链。
+#   GitHub Actions 的 runner 在美国/新加坡，不受这个限制。
+#   所以本 workflow 在云端装 devkitPro 并编译，本机完全不需要装任何东西。
+#
+# 触发：push 代码，或在 Actions 页面手动点 "Run workflow"
+
+name: build-nro
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 devkitPro（云端，Debian 源）
+        run: |
+          set -e
+          wget -q https://apt.devkitpro.org/install-devkitpro-pacman
+          chmod +x ./install-devkitpro-pacman
+          sudo ./install-devkitpro-pacman
+          sudo dkp-pacman -Syu --noconfirm
+
+      - name: 3. 安装 Switch 工具链与 libcurl
+        run: |
+          set -e
+          sudo dkp-pacman -S --needed --noconfirm switch-dev
+          sudo dkp-pacman -S --needed --noconfirm switch-curl
+
+      - name: 4. 拉取 borealis（界面库，源码引入）
+        run: |
+          set -e
+          git clone --depth=1 --recursive https://github.com/XITRIX/borealis.git borealis
+
+      - name: 5. 同步 borealis 运行时资源
+        run: |
+          set -e
+          export DEVKITPRO=/opt/devkitpro
+          make sync-resources
+
+      - name: 6. 编译
+        run: |
+          set -e
+          export DEVKITPRO=/opt/devkitpro
+          make -j$(nproc)
+
+      - name: 7. 产物信息
+        run: |
+          ls -lh *.nro *.nacp *.elf 2>/dev/null || true
+          echo "--- readelf 头部校验 ---"
+          /opt/devkitpro/devkitA64/bin/aarch64-none-elf-readelf -h nx-downloader.elf || true
+
+      - name: 8. 上传 .nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: nx-downloader-nro
+          path: |
+            *.nro
+            *.elf
+          if-no-files-found: error
