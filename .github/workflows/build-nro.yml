@@ -1,10 +1,14 @@
 # NX Downloader —— 在 GitHub 的服务器上编译，产出 nx-downloader.nro
 #
 # 为什么这么做：
-#   devkitPro 的包服务器 pkg.devkitpro.org 挂在 Cloudflare 后面，
-#   部分地区（含中国大陆很多宽带出口）会被整站 403，导致本机装不上工具链。
-#   GitHub Actions 的 runner 在美国/新加坡，不受这个限制。
-#   所以本 workflow 在云端装 devkitPro 并编译，本机完全不需要装任何东西。
+#   devkitPro 的包服务器挂在 Cloudflare 后面，部分地区（含中国大陆很多宽带出口）
+#   会被整站 403，本机装不上工具链。GitHub Actions 的 runner 在海外，通常不受限。
+#
+# 两条路（自动选择）：
+#   A. native：用 devkitPro 官方的 Debian 安装脚本直接装（快）
+#   B. docker：若 apt.devkitpro.org 不可达（Cloudflare 拦截 runner IP），
+#      退回到官方镜像 devkitpro/devkita64 —— 镜像里已经装好了 devkitA64、libnx、
+#      switch-dev 和 switch-portlibs（含 switch-curl），不需要再联网装包。
 #
 # 触发：push 代码，或在 Actions 页面手动点 "Run workflow"
 
@@ -22,15 +26,27 @@ jobs:
       - name: 1. 检出代码
         uses: actions/checkout@v4
 
-      - name: 2. 安装 devkitPro（云端，Debian 源）
+      - name: 2. 准备 devkitPro（优先官方脚本，不可达则用官方 Docker 镜像）
+        id: dkp
         run: |
-          set -e
-          wget -q https://apt.devkitpro.org/install-devkitpro-pacman
-          chmod +x ./install-devkitpro-pacman
-          sudo ./install-devkitpro-pacman
-          sudo dkp-pacman -Syu --noconfirm
+          set -x
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          code=$(curl -sSL -A "$UA" -o /tmp/idp -w '%{http_code}' \
+                 https://apt.devkitpro.org/install-devkitpro-pacman || echo 000)
+          echo "apt.devkitpro.org HTTP status = $code"
+          if [ "$code" = "200" ] && grep -q pacman /tmp/idp; then
+            chmod +x /tmp/idp
+            sudo /tmp/idp
+            sudo dkp-pacman -Syu --noconfirm
+            echo "mode=native" >> "$GITHUB_OUTPUT"
+          else
+            echo "apt.devkitpro.org 不可达，改用官方 Docker 镜像 devkitpro/devkita64"
+            docker pull devkitpro/devkita64:latest
+            echo "mode=docker" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: 3. 安装 Switch 工具链与 libcurl
+      - name: 3. 安装 Switch 工具链与 libcurl（仅 native 模式需要）
+        if: steps.dkp.outputs.mode == 'native'
         run: |
           set -e
           sudo dkp-pacman -S --needed --noconfirm switch-dev
@@ -44,20 +60,32 @@ jobs:
       - name: 5. 同步 borealis 运行时资源
         run: |
           set -e
-          export DEVKITPRO=/opt/devkitpro
-          make sync-resources
+          if [ "${{ steps.dkp.outputs.mode }}" = "native" ]; then
+            export DEVKITPRO=/opt/devkitpro
+            export PATH="/opt/devkitpro/tools/bin:$PATH"
+            make sync-resources
+          else
+            docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64:latest \
+              bash -lc 'make sync-resources'
+          fi
 
       - name: 6. 编译
         run: |
           set -e
-          export DEVKITPRO=/opt/devkitpro
-          make -j$(nproc)
+          if [ "${{ steps.dkp.outputs.mode }}" = "native" ]; then
+            export DEVKITPRO=/opt/devkitpro
+            export PATH="/opt/devkitpro/tools/bin:$PATH"
+            make -j$(nproc)
+          else
+            docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64:latest \
+              bash -lc 'make -j$(nproc)'
+            # 容器里是 root，产物属主改回 runner，否则上传 artifact 会无权读取
+            sudo chown -R "$(id -u):$(id -g)" . || true
+          fi
 
       - name: 7. 产物信息
         run: |
-          ls -lh *.nro *.nacp *.elf 2>/dev/null || true
-          echo "--- readelf 头部校验 ---"
-          /opt/devkitpro/devkitA64/bin/aarch64-none-elf-readelf -h nx-downloader.elf || true
+          ls -lh *.nro *.elf *.nacp 2>/dev/null || true
 
       - name: 8. 上传 .nro
         uses: actions/upload-artifact@v4
