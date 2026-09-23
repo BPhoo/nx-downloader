@@ -34,14 +34,26 @@ using namespace i18n::literals;
 ///   从「相册」启动时是 Applet 模式，可用内存远小于完整应用模式，
 ///   socketInitializeDefault() 默认的缓冲配置可能申请失败而返回非 0。
 ///   这里先用默认配置，失败再退回到一份较小的配置重试一次。
+/// 兼容不同版本 libnx 的 SocketInitConfig：
+/// 旧版本带有 bsdsockets_version 字段，新版本已移除该字段。
+/// 用 SFINAE 让「赋值」只在字段存在时才发生，从而一份代码两种布局都能编译。
+template <typename T>
+static auto setBsdVersion(T& c, int v, int) -> decltype(c.bsdsockets_version = v, void())
+{
+    c.bsdsockets_version = v;
+}
+template <typename T>
+static void setBsdVersion(T&, int, long)
+{
+}
+
 static bool initNetwork()
 {
     if (R_SUCCEEDED(socketInitializeDefault()))
         return true;
 
-    SocketInitConfig cfg;
-    std::memset(&cfg, 0, sizeof(cfg));
-    cfg.bsdsockets_version   = 1;
+    SocketInitConfig cfg{}; // 值初始化：所有字段先清零
+    setBsdVersion(cfg, 1, 0);
     cfg.tcp_tx_buf_size      = 0x8000;
     cfg.tcp_rx_buf_size      = 0x10000;
     cfg.tcp_tx_buf_max_size  = 0x40000;
