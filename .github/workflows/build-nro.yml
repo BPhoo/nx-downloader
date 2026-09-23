@@ -55,7 +55,12 @@ jobs:
       - name: 4. 拉取 borealis（界面库，源码引入）
         run: |
           set -e
-          git clone --depth=1 --recursive https://github.com/XITRIX/borealis.git borealis
+          # 注意：XITRIX/borealis 的默认分支是 moonlight_wiliwili（结构不同），
+          # 必须显式指定 master 分支，否则找不到 library/borealis.mk
+          git clone --depth=1 --recursive -b master \
+            https://github.com/XITRIX/borealis.git borealis
+          test -f borealis/library/borealis.mk || { echo "borealis.mk 缺失"; exit 1; }
+          ls -l borealis/library/borealis.mk
 
       - name: 5. 同步 borealis 运行时资源
         run: |
