@@ -12,8 +12,8 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
-#include <thread>
 
 class Downloader
 {
@@ -85,8 +85,16 @@ class Downloader
     static bool isSupportedUrl(const std::string& url);
 
   private:
+    // pthread 入口：C++ 调用约定与 void*(*)(void*) 兼容（ARM/EABI 上无差别）
+    static void* threadEntry(void* arg);
+
     void run();
 
     std::shared_ptr<Progress> progress;
-    std::thread worker;
+
+    // 工作线程本身。libnx 上 std::thread 创建的线程默认栈只有 128KB，
+    // 而 libcurl + mbedTLS 的 TLS 握手栈用量很容易超过它 → 栈溢出（2168-0002）。
+    // 因此这里改用手动 pthread_create，并显式指定一个宽裕的栈（2MiB）。
+    pthread_t worker  = {};
+    bool workerValid  = false;
 };
