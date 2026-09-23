@@ -76,17 +76,31 @@ jobs:
 
       - name: 6. 编译
         run: |
-          set -e
+          set -o pipefail
           if [ "${{ steps.dkp.outputs.mode }}" = "native" ]; then
             export DEVKITPRO=/opt/devkitpro
             export PATH="/opt/devkitpro/tools/bin:$PATH"
-            make -j$(nproc)
+            make -j$(nproc) 2>&1 | tail -200 | tee build.log
           else
             docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64:latest \
-              bash -lc 'make -j$(nproc)'
+              bash -lc 'make -j$(nproc)' 2>&1 | tail -200 | tee build.log
             # 容器里是 root，产物属主改回 runner，否则上传 artifact 会无权读取
             sudo chown -R "$(id -u):$(id -g)" . || true
           fi
+          {
+            echo '### make 输出（末尾 200 行）'
+            echo '```'
+            cat build.log
+            echo '```'
+            echo '### 工作区根目录'
+            echo '```'
+            ls -la
+            echo '```'
+            echo '### 产物搜索'
+            echo '```'
+            find . -maxdepth 3 \( -name '*.nro' -o -name '*.elf' -o -name '*.nacp' \) | head -20
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 7. 产物信息
         run: |
