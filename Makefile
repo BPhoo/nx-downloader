@@ -163,6 +163,11 @@ endif
 
 .PHONY: $(BUILD) clean all sync-resources
 
+# 必须显式指定默认目标：
+#   GNU make 默认执行文件里「第一个」目标，而 sync-resources 规则写在 all 之前，
+#   不加这行的话直接 `make` 只会同步资源、不编译（表现为 1 秒结束且没有 .nro）。
+.DEFAULT_GOAL := all
+
 #---------------------------------------------------------------------------------
 # 把 borealis 的运行时资源同步进 romfs/
 #   * i18n/     —— 底部按键提示、崩溃界面的文案
