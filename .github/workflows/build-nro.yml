@@ -62,6 +62,14 @@ jobs:
           test -f borealis/library/borealis.mk || { echo "borealis.mk 缺失"; exit 1; }
           ls -l borealis/library/borealis.mk
 
+      - name: 4b. 修补 borealis 与新版 libnx 的不兼容
+        run: |
+          set -e
+          # 新版 libnx 移除了 swkbdConfigSetStringLenMaxExt，borealis(master) 还在用
+          sed -i 's/swkbdConfigSetStringLenMaxExt(&config, 1);/swkbdConfigSetStringLenMax(\&config, 32);/' \
+            borealis/library/lib/swkbd.cpp
+          grep -n "StringLenMax" borealis/library/lib/swkbd.cpp
+
       - name: 5. 同步 borealis 运行时资源
         run: |
           set -e
