@@ -302,6 +302,12 @@ bool Downloader::isSupportedUrl(const std::string& url)
     return lower.compare(0, 7, "http://") == 0 || lower.compare(0, 8, "https://") == 0;
 }
 
+void* Downloader::threadEntry(void* arg)
+{
+    static_cast<Downloader*>(arg)->run();
+    return nullptr;
+}
+
 bool Downloader::start(const std::string& url, const std::string& destDirectory)
 {
     // 上一轮线程理论上已经结束，这里只是兜底
@@ -318,7 +324,28 @@ bool Downloader::start(const std::string& url, const std::string& destDirectory)
     prog->destDir = fsx::normalize(destDirectory);
 
     this->progress = prog;
-    this->worker   = std::thread(&Downloader::run, this);
+
+    // 关键：用 pthread 显式指定一个宽裕的栈（2MiB）。
+    // libnx 的 std::thread 默认栈只有 128KB，跑 libcurl + mbedTLS 的 TLS 握手会
+    // 直接栈溢出（表现为 2168-0002 数据中止，且崩溃现场 PC 指向乱七八糟的地方）。
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        // 2 * 1024 * 1024 = 2MiB，足够 TLS 握手 + curl 内部栈帧，并留足余量。
+        pthread_attr_setstacksize(&attr, 2u * 1024u * 1024u);
+        const int rc = pthread_create(&this->worker, &attr, &Downloader::threadEntry, this);
+        pthread_attr_destroy(&attr);
+
+        if (rc != 0)
+        {
+            // 线程都没起得来：直接报错，不要让 UI 卡在「下载中」
+            setError(prog.get(), "无法创建工作线程（pthread_create 失败）");
+            prog->state.store(State::Failed);
+            this->workerValid = false;
+            return false;
+        }
+        this->workerValid = true;
+    }
 
     return true;
 }
@@ -332,8 +359,11 @@ void Downloader::requestCancel()
 
 void Downloader::join()
 {
-    if (this->worker.joinable())
-        this->worker.join();
+    if (this->workerValid)
+    {
+        pthread_join(this->worker, nullptr);
+        this->workerValid = false;
+    }
 }
 
 bool Downloader::running() const
