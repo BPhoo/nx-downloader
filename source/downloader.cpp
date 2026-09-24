@@ -10,10 +10,14 @@
 
 #include <curl/curl.h>
 
+#include "app_config.hpp"
 #include "fsx.hpp"
 
 namespace
 {
+
+// 文本模式最多保留多少响应体（超出部分丢弃，但仍然继续读连接）
+constexpr size_t MAX_TEXT_BYTES = 512 * 1024;
 
 //=====================================================================
 // 一次传输的上下文，只在工作线程内使用（curl 的回调是同线程串行调用的）
@@ -26,6 +30,10 @@ struct Transfer
     FsFile file   = {};
     bool fileOpen = false;
     s64 offset    = 0;
+
+    // 内存模式（检查更新）攒下来的响应体
+    std::string body;
+    bool truncated = false;
 
     // 从响应头里抓到的信息
     std::string contentDisposition;
@@ -100,7 +108,7 @@ std::string findCaBundle()
 {
     static const char* candidates[] = {
         "romfs:/cacert.pem",
-        "sdmc:/switch/nx-downloader/cacert.pem",
+        appcfg::CA_BUNDLE,
     };
 
     for (const char* path : candidates)
@@ -131,6 +139,26 @@ size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
 
     if (ctx->prog->cancelRequested.load())
         return 0; // 通知 curl 中止
+
+    //-----------------------------------------------------------------
+    // 内存模式（检查更新）：响应体直接攒在内存里，完全不落盘
+    //-----------------------------------------------------------------
+    if (ctx->prog->mode == Downloader::Mode::ToMemory)
+    {
+        if (ctx->body.size() < MAX_TEXT_BYTES)
+        {
+            const size_t room = MAX_TEXT_BYTES - ctx->body.size();
+            ctx->body.append(ptr, len < room ? len : room);
+        }
+        else
+        {
+            // 超出上限就丢弃多余数据 —— 但仍然返回 len 把连接读完，
+            // 否则 curl 会以写错误收场，把一次正常的传输判成失败。
+            ctx->truncated = true;
+        }
+
+        return len;
+    }
 
     // 第一次拿到数据时才能确定最终文件名
     // （可能来自重定向后的 URL，或 Content-Disposition）
@@ -195,8 +223,8 @@ int xferInfoCallback(void* userdata, curl_off_t dltotal, curl_off_t dlnow, curl_
         percent           = std::max<long long>(0, std::min<long long>(100, percent));
         ctx->prog->percent.store(static_cast<int>(percent));
 
-        // 剩余空间只检查一次
-        if (!ctx->spaceChecked)
+        // 剩余空间只检查一次（只有落盘模式才有意义）
+        if (ctx->prog->mode == Downloader::Mode::ToFile && !ctx->spaceChecked)
         {
             ctx->spaceChecked = true;
 
@@ -310,16 +338,28 @@ void* Downloader::threadEntry(void* arg)
 
 bool Downloader::start(const std::string& url, const std::string& destDirectory)
 {
+    return this->startInternal(url, destDirectory, Mode::ToFile);
+}
+
+bool Downloader::startFetchText(const std::string& url)
+{
+    return this->startInternal(url, "", Mode::ToMemory);
+}
+
+bool Downloader::startInternal(const std::string& url, const std::string& destDirectory, Mode mode)
+{
     // 上一轮线程理论上已经结束，这里只是兜底
     this->join();
 
     if (!isSupportedUrl(url))
         return false;
 
-    if (!fsx::ensureDirectory(destDirectory))
+    // 只有落盘模式才需要目标目录
+    if (mode == Mode::ToFile && !fsx::ensureDirectory(destDirectory))
         return false;
 
     auto prog     = std::make_shared<Progress>();
+    prog->mode    = mode;
     prog->url     = trim(url);
     prog->destDir = fsx::normalize(destDirectory);
 
@@ -380,6 +420,38 @@ Downloader::State Downloader::state() const
 {
     std::shared_ptr<Progress> prog = this->progress;
     return prog ? prog->state.load() : State::Idle;
+}
+
+Downloader::Mode Downloader::mode() const
+{
+    std::shared_ptr<Progress> prog = this->progress;
+    return prog ? prog->mode : Mode::ToFile;
+}
+
+long Downloader::httpStatus() const
+{
+    std::shared_ptr<Progress> prog = this->progress;
+    return prog ? prog->httpStatus.load() : 0;
+}
+
+std::string Downloader::bodyText() const
+{
+    std::shared_ptr<Progress> prog = this->progress;
+    if (!prog)
+        return "";
+
+    std::lock_guard<std::mutex> lock(prog->mtx);
+    return prog->body;
+}
+
+bool Downloader::bodyTruncated() const
+{
+    std::shared_ptr<Progress> prog = this->progress;
+    if (!prog)
+        return false;
+
+    std::lock_guard<std::mutex> lock(prog->mtx);
+    return prog->truncated;
 }
 
 int Downloader::percent() const
@@ -491,16 +563,28 @@ void Downloader::run()
             ctx.fileOpen = false;
         }
 
+        // 内存模式：把这一轮拿到的正文交给共享状态（UI 线程随后可读）
+        if (prog->mode == Mode::ToMemory)
+        {
+            std::lock_guard<std::mutex> lock(prog->mtx);
+            prog->body      = ctx.body;
+            prog->truncated = ctx.truncated;
+        }
+
         if (rc == CURLE_OK)
         {
             prog->tlsVerified.store(verify);
 
-            // 尺寸校验：服务器声明了长度就必须完全一致
-            curl_off_t expected = -1;
-            curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &expected);
+            // 尺寸校验：服务器声明了长度就必须完全一致。
+            // 内存模式不适用 —— offset 恒为 0，而且可能被主动截断。
+            if (prog->mode == Mode::ToFile)
+            {
+                curl_off_t expected = -1;
+                curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &expected);
 
-            if (expected > 0 && ctx.offset != static_cast<s64>(expected))
-                rc = CURLE_PARTIAL_FILE;
+                if (expected > 0 && ctx.offset != static_cast<s64>(expected))
+                    rc = CURLE_PARTIAL_FILE;
+            }
 
             break;
         }
@@ -526,7 +610,22 @@ void Downloader::run()
             prog->finalUrl = prog->url;
     }
 
+    // 记下 HTTP 响应码（必须在 curl_easy_cleanup 之前取）
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    prog->httpStatus.store(httpCode);
+
     curl_easy_cleanup(curl);
+
+    // HTTP 层面的错误（404 / 500 之类）也必须当失败处理：
+    // 否则会把服务器返回的错误页面当成「下载成功」存到 SD 卡上。
+    if (rc == CURLE_OK && httpCode >= 400)
+    {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "服务器返回 HTTP %ld", httpCode);
+        setError(prog.get(), buf);
+        rc = CURLE_HTTP_RETURNED_ERROR;
+    }
 
     if (rc == CURLE_OK)
     {

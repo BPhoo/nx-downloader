@@ -36,10 +36,18 @@ void PathPickerView::willAppear(bool resetState)
 void PathPickerView::confirmCurrent()
 {
     auto callback = this->onSelect;
-    if (callback)
-        callback(this->currentPath);
 
-    Application::popView();
+    if (!callback)
+    {
+        Application::popView();
+        return;
+    }
+
+    // 先让本视图出栈、再回调，避免回调里弹出的提示框被 popView 顶掉
+    const std::string path = this->currentPath;
+    Application::popView(ViewAnimation::FADE, [callback, path] {
+        callback(path);
+    });
 }
 
 void PathPickerView::rebuild()

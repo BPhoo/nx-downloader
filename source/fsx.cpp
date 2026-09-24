@@ -216,6 +216,60 @@ bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* n
     return true;
 }
 
+bool listDirectory(const std::string& sdmcPath, std::vector<std::string>* dirs, std::vector<std::string>* files)
+{
+    if (!g_opened)
+        return false;
+
+    if (dirs != nullptr)
+        dirs->clear();
+    if (files != nullptr)
+        files->clear();
+
+    FsDir dir = {};
+    Result rc = fsFsOpenDirectory(&g_sd, toFsPath(sdmcPath).c_str(), FsDirOpenMode_ReadAll, &dir);
+    if (R_FAILED(rc))
+        return false;
+
+    FsDirectoryEntry entries[DIR_BATCH];
+
+    s64 count = 0;
+    while (true)
+    {
+        count = 0;
+        rc    = fsDirRead(&dir, &count, DIR_BATCH, entries);
+        if (R_FAILED(rc) || count == 0)
+            break;
+
+        for (s64 i = 0; i < count; i++)
+        {
+            std::string name = entries[i].name;
+            if (name.empty() || name == "." || name == "..")
+                continue;
+
+            if (entries[i].type == FsDirEntryType_Dir)
+            {
+                if (dirs != nullptr)
+                    dirs->push_back(name);
+            }
+            else
+            {
+                if (files != nullptr)
+                    files->push_back(name);
+            }
+        }
+    }
+
+    fsDirClose(&dir);
+
+    if (dirs != nullptr)
+        std::sort(dirs->begin(), dirs->end());
+    if (files != nullptr)
+        std::sort(files->begin(), files->end());
+
+    return true;
+}
+
 bool getFreeSpace(const std::string& sdmcPath, s64* out)
 {
     if (!g_opened || out == nullptr)

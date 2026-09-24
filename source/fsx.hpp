@@ -43,6 +43,10 @@ bool createAndOpenFile(const std::string& sdmcPath, FsFile* out);
 /// 列出某个目录下的子目录名（不含文件），按名称排序
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names);
 
+/// 列出目录内容：子目录名与文件名分别收集，各自按名称排序
+/// dirs / files 任一为 nullptr 表示不关心该项
+bool listDirectory(const std::string& sdmcPath, std::vector<std::string>* dirs, std::vector<std::string>* files);
+
 /// 查询剩余空间（字节）
 bool getFreeSpace(const std::string& sdmcPath, s64* out);
 

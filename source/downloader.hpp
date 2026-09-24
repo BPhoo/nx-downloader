@@ -21,10 +21,17 @@ class Downloader
     enum class State
     {
         Idle = 0,   // 未开始
-        Running,    // 下载中
+        Running,    // 进行中
         Finished,   // 完成
         Failed,     // 失败
         Cancelled,  // 被取消
+    };
+
+    /// 传输目标：落盘 / 只把响应体读进内存
+    enum class Mode
+    {
+        ToFile = 0, // 下载文件到 SD 卡
+        ToMemory,   // 检查更新：只取返回内容，不写盘
     };
 
     /// 工作线程与 UI 线程共享的状态，读取方只需要看原子变量
@@ -36,13 +43,20 @@ class Downloader
         std::atomic<long long> downloaded{0};
         std::atomic<long long> total{0};
 
+        /// HTTP 响应码（0 表示还没拿到）
+        std::atomic<long> httpStatus{0};
+
         // 是否真正校验过证书。UI 线程在工作线程运行期间就可能读到它，
         // 所以必须是原子的，不能放在下面那组「持锁访问」的字段里。
         std::atomic<bool> tlsVerified{false};
 
+        // 传输模式。只在 start() 里写一次，且写入发生在创建线程之前，
+        // 因此工作线程读取它是安全的（有 happens-before 保证）。
+        Mode mode = Mode::ToFile;
+
         //------------------------- 以下字段必须持 mtx 访问 -------------------------
         // url / destDir 是个例外：它们只在 start() 里写一次，且写入发生在
-        // std::thread 创建之前，因此工作线程读取它们是安全的（有 happens-before 保证）。
+        // 创建线程之前，因此工作线程读取它们是安全的（有 happens-before 保证）。
         std::mutex mtx;
         std::string url;
         std::string destDir;
@@ -50,6 +64,10 @@ class Downloader
         std::string outputPath;
         std::string finalUrl;
         std::string error;
+        /// 内存模式的响应体（ToMemory 才有内容）
+        std::string body;
+        /// 内存模式的响应体是否因为超过上限被截断
+        bool truncated = false;
     };
 
     Downloader() = default;
@@ -61,7 +79,10 @@ class Downloader
     /// 开始下载。url 必须是 http/https，destDirectory 形如 "sdmc:/downloads"
     bool start(const std::string& url, const std::string& destDirectory);
 
-    /// 请求取消当前下载（不阻塞）
+    /// 拉取文本（检查更新用）：响应体读进内存，不写 SD 卡
+    bool startFetchText(const std::string& url);
+
+    /// 请求取消当前任务（不阻塞）
     void requestCancel();
 
     /// 等待工作线程退出（若已退出则立即返回）
@@ -72,19 +93,27 @@ class Downloader
 
     //---------------- 供 UI 线程读取的只读接口 ----------------//
     State state() const;
+    Mode mode() const;
     int percent() const;
     long long downloaded() const;
     long long total() const;
+    long httpStatus() const;
     bool tlsVerified() const;
     std::string errorText() const;
     std::string outputPath() const;
     std::string fileName() const;
     std::string finalUrl() const;
 
+    /// 内存模式下拉到的响应体（任务结束后才有意义）
+    std::string bodyText() const;
+    bool bodyTruncated() const;
+
     /// 检查 URL 是否是我们支持的协议
     static bool isSupportedUrl(const std::string& url);
 
   private:
+    bool startInternal(const std::string& url, const std::string& destDirectory, Mode mode);
+
     // pthread 入口：C++ 调用约定与 void*(*)(void*) 兼容（ARM/EABI 上无差别）
     static void* threadEntry(void* arg);
 
@@ -95,6 +124,6 @@ class Downloader
     // 工作线程本身。libnx 上 std::thread 创建的线程默认栈只有 128KB，
     // 而 libcurl + mbedTLS 的 TLS 握手栈用量很容易超过它 → 栈溢出（2168-0002）。
     // 因此这里改用手动 pthread_create，并显式指定一个宽裕的栈（2MiB）。
-    pthread_t worker  = {};
-    bool workerValid  = false;
+    pthread_t worker = {};
+    bool workerValid = false;
 };

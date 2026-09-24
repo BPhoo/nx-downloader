@@ -17,7 +17,8 @@ class Downloader;
 class DownloadProgressContent : public brls::BoxLayout
 {
   public:
-    explicit DownloadProgressContent(const std::string& fileName);
+    /// title 显示在进度条上方（下载时是文件名，检查更新时是一句说明）
+    explicit DownloadProgressContent(const std::string& title);
 
     void setDetail(const std::string& text);
     void setProgress(int percent);
@@ -28,11 +29,11 @@ class DownloadProgressContent : public brls::BoxLayout
     brls::ProgressDisplay* bar      = nullptr;
 };
 
-/// 模态下载对话框：内容 + 一个「取消」按钮
+/// 模态进度对话框：内容 + 一个「取消」按钮
 class DownloadProgressDialog
 {
   public:
-    DownloadProgressDialog(const std::string& fileName, std::function<void()> onCancelRequested);
+    DownloadProgressDialog(const std::string& title, std::function<void()> onCancelRequested);
 
     /// 推入视图栈显示
     void open();

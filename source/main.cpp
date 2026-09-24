@@ -1,7 +1,11 @@
 /*
     NX Downloader
     ------------
-    Nintendo Switch 自制程序：输入链接 → 选择保存目录 → 下载到 SD 卡。
+    Nintendo Switch 自制程序：
+      * 第一行：输入 / 读取更新链接 → 访问 → 显示服务器返回内容
+      * 第二行：输入 / 读取下载链接 → 访问 → 下载文件到 SD 卡（可选目录、有进度、有完成与错误提示）
+
+    启动时会确保项目文件夹与 url.txt 存在（不存在则创建）。
 
     依赖：
       * devkitPro (libnx)
@@ -21,6 +25,7 @@
 // nanovg 的上下文与 fallback 接口（borealis 的 include 路径里已经带了）
 #include <nanovg/nanovg.h>
 
+#include "app_config.hpp"
 #include "downloader.hpp"
 #include "fsx.hpp"
 #include "main_view.hpp"
@@ -171,12 +176,16 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // 准备好默认目录（失败不致命，真正下载时会再检查一次）
-    fsx::ensureDirectory("sdmc:/switch/nx-downloader");
-    fsx::ensureDirectory("sdmc:/downloads");
+    //------------------------------------------------------------------
+    // 4. 项目文件夹与 url.txt
+    //    没有项目文件夹就创建，没有 url.txt 就在里面生成一份模板
+    //------------------------------------------------------------------
+    bool createdDir  = false;
+    bool createdFile = false;
+    const bool projectOk = appcfg::ensureProjectLayout(&createdDir, &createdFile);
 
     //------------------------------------------------------------------
-    // 4. borealis
+    // 5. borealis
     //------------------------------------------------------------------
     brls::Logger::setLogLevel(brls::LogLevel::INFO);
 
@@ -194,17 +203,26 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
+    if (!projectOk)
+        brls::Application::notify("无法创建项目文件夹，url.txt 相关功能不可用：" + std::string(appcfg::PROJECT_DIR));
+    else if (createdDir && createdFile)
+        brls::Application::notify("已创建项目文件夹与 url.txt：" + std::string(appcfg::PROJECT_DIR));
+    else if (createdFile)
+        brls::Application::notify("已生成 url.txt：" + std::string(appcfg::URL_FILE));
+    else if (createdDir)
+        brls::Application::notify("已创建项目文件夹：" + std::string(appcfg::PROJECT_DIR));
+
     if (!socketOk)
-        brls::Application::notify("网络初始化失败：下载功能不可用。请确认已连接 Wi-Fi；若从相册启动仍失败，可按住 R 键从游戏图标以完整内存模式启动");
+        brls::Application::notify("网络初始化失败：联网功能不可用。请确认已连接 Wi-Fi；若从相册启动仍失败，可按住 R 键从游戏图标以完整内存模式启动");
 
     //------------------------------------------------------------------
-    // 5. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
+    // 6. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
     //    否则英文/日文主机上的中文会全是方块
     //------------------------------------------------------------------
     attachChineseFallbackFont();
 
     //------------------------------------------------------------------
-    // 6. 主界面
+    // 7. 主界面
     //------------------------------------------------------------------
     brls::Application::pushView(new MainView(&g_downloader));
 
@@ -212,8 +230,8 @@ int main(int argc, char* argv[])
         ;
 
     //------------------------------------------------------------------
-    // 7. 收尾顺序很重要：
-    //    先让下载线程退出（它还在用文件系统），再关文件系统 / 网络
+    // 8. 收尾顺序很重要：
+    //    先让工作线程退出（它还在用文件系统），再关文件系统 / 网络
     //------------------------------------------------------------------
     g_downloader.requestCancel();
     g_downloader.join();

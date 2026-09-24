@@ -2,24 +2,31 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include <nanovg/nanovg.h>
+
+#include "file_picker.hpp"
 #include "fsx.hpp"
 #include "path_picker.hpp"
 #include "progress_dialog.hpp"
 
 using namespace brls;
 
+//=====================================================================
+// 常量与工具
+//=====================================================================
 namespace
 {
 
-// 设置文件（同时也可以作为「Applet 模式下软键盘不可用」时的备用输入方式）
-const char* SETTINGS_DIR  = "sdmc:/switch/nx-downloader";
-const char* SETTINGS_PATH = "sdmc:/switch/nx-downloader/settings.txt";
+/// 输入框最长 100 字符（需求规定的上限，没有下限）
+constexpr int MAX_URL_LENGTH = 100;
 
-// 链接最大长度（swkbd 的缓冲上限是 0x100 字节，这里保守一点）
-constexpr int MAX_URL_LENGTH = 240;
+/// 检查更新时最多在结果页里显示多少字节（防止超大响应把界面撑爆）
+constexpr size_t MAX_RESULT_DISPLAY = 4000;
 
 unsigned listItemHeight()
 {
@@ -48,102 +55,255 @@ std::string stripLineBreaks(const std::string& s)
     return out;
 }
 
-/// 链接输入框：按 A 调起系统软键盘；按 X 从 url.txt / settings.txt 读取
+/// 按显示宽度裁剪字符串（超出补省略号）。按 UTF-8 码点回退，不会切坏汉字。
+std::string fitText(NVGcontext* vg, const std::string& text, float maxWidth)
+{
+    if (text.empty() || maxWidth <= 0.0f)
+        return "";
+
+    float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    nvgTextBounds(vg, 0.0f, 0.0f, text.c_str(), nullptr, bounds);
+    if (bounds[2] - bounds[0] <= maxWidth)
+        return text;
+
+    std::string out = text;
+
+    while (!out.empty())
+    {
+        size_t cut = out.size() - 1;
+
+        // 不要切在 UTF-8 的续字节上
+        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
+            cut--;
+
+        out.resize(cut);
+
+        const std::string trial = out + "…";
+        nvgTextBounds(vg, 0.0f, 0.0f, trial.c_str(), nullptr, bounds);
+        if (bounds[2] - bounds[0] <= maxWidth)
+            return trial;
+    }
+
+    return "";
+}
+
+/// 按字节上限裁剪（同样不切坏 UTF-8）
+std::string capText(const std::string& text, size_t maxBytes)
+{
+    if (text.size() <= maxBytes)
+        return text;
+
+    size_t cut = maxBytes;
+    while (cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
+        cut--;
+
+    return text.substr(0, cut) + "\n\n…（内容过长，已截断显示）";
+}
+
+} // namespace
+
+//=====================================================================
+// 输入框
+//
+// 注意：UrlInputItem / InputRow 必须放在全局作用域，不能塞进上面的匿名
+// 命名空间 —— main_view.hpp 里对 InputRow 做的是全局作用域的前置声明，
+// 匿名命名空间里的同名类是完全不同的类型，会编译不过。
+//=====================================================================
+
+/// 一行里的链接输入框。
+///
+/// 为什么不用 ListItem 自带的 value：value 是右对齐绘制的，链接动辄上百字符，
+/// 右对齐会让文字一路向左溢出、盖住左边的标题。这里整段自绘：
+///   * 左边一个标题
+///   * 右边一个圆角框，内容是左对齐、超长截断的链接文本
 class UrlInputItem : public ListItem
 {
   public:
-    UrlInputItem()
-        : ListItem("下载链接", "按 A 输入 http/https 直链，按 X 从 url.txt 读取")
+    UrlInputItem(const std::string& labelText, const std::string& placeholder)
+        : ListItem(labelText, "")
+        , placeholder(placeholder)
     {
-        this->registerAction("从文件读取", Key::X, [this] {
-            this->loadFromFile();
-            return true;
-        });
+        this->setDrawTopSeparator(false);
     }
+
+    /// 内容被改动时回调（用来把设置落盘）
+    std::function<void()> onChange;
 
     bool onClick() override
     {
-        const std::string initial = stripLineBreaks(this->getValue());
+        const std::string initial = this->url;
 
         const bool ok = Swkbd::openForText(
-            [this](std::string text) { this->setValue(stripLineBreaks(text), false); },
-            "下载链接",
-            "例如 https://example.com/file.zip",
+            [this](std::string value) { this->setText(value); },
+            this->label,
+            this->placeholder,
             MAX_URL_LENGTH,
             initial);
 
         if (!ok)
-            Application::notify("没有拿到输入。若系统键盘不可用，可按 X 从 url.txt 读取");
+            Application::notify("系统键盘没能打开：Applet 模式下请按 X 或点文件图标从 url.txt 读取");
 
         return true;
     }
 
+    void setText(const std::string& value)
+    {
+        this->url = stripLineBreaks(value);
+        this->invalidate();
+
+        if (this->onChange)
+            this->onChange();
+    }
+
+    const std::string& text() const
+    {
+        return this->url;
+    }
+
+    void draw(NVGcontext* vg, int x, int y, unsigned width, unsigned height, Style* style, FrameContext* ctx) override
+    {
+        const unsigned padding = style->List.Item.padding;
+        const int midY         = y + static_cast<int>(height / 2);
+
+        //------------------------- 左侧标题 -------------------------
+        nvgFontFaceId(vg, ctx->fontStash->regular);
+        nvgFontSize(vg, this->textSize);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, ctx->theme->textColor);
+
+        unsigned labelWidth = 0;
+        if (!this->label.empty())
+        {
+            float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            nvgTextBounds(vg, 0.0f, 0.0f, this->label.c_str(), nullptr, bounds);
+            labelWidth = static_cast<unsigned>(bounds[2] - bounds[0]);
+
+            nvgBeginPath(vg);
+            nvgText(vg, static_cast<float>(x + padding), static_cast<float>(midY), this->label.c_str(), nullptr);
+        }
+
+        //------------------------- 右侧输入框 -------------------------
+        const unsigned boxLeft = x + padding + labelWidth + padding;
+        if (boxLeft + padding + 80 >= x + width)
+            return; // 空间不够就不画了，避免出现负宽度
+
+        const unsigned boxWidth  = (x + width - padding) - boxLeft;
+        const unsigned boxHeight = height - height / 4;
+        const int boxTop         = y + static_cast<int>((height - boxHeight) / 2);
+        const float radius       = static_cast<float>(boxHeight) / 4.0f;
+
+        // 底：借用分隔线色做一层很淡的填充，深/浅主题下都能看见
+        nvgFillColor(vg, ctx->theme->listItemSeparatorColor);
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, static_cast<float>(boxLeft), static_cast<float>(boxTop),
+            static_cast<float>(boxWidth), static_cast<float>(boxHeight), radius);
+        nvgFill(vg);
+
+        // 内容
+        const unsigned textLeft = boxHeight / 4;
+        const float maxTextW    = static_cast<float>(boxWidth) - textLeft * 2.0f;
+
+        const bool empty        = this->url.empty();
+        const std::string& body = empty ? this->placeholder : this->url;
+
+        nvgFontSize(vg, style->List.Item.valueSize);
+        nvgFontFaceId(vg, ctx->fontStash->regular);
+        nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
+        nvgFillColor(vg, empty ? ctx->theme->descriptionColor : ctx->theme->listItemValueColor);
+
+        const std::string shown = fitText(vg, body, maxTextW);
+
+        nvgBeginPath(vg);
+        nvgText(vg, static_cast<float>(boxLeft + textLeft), static_cast<float>(boxTop + static_cast<int>(boxHeight / 2)),
+            shown.c_str(), nullptr);
+    }
+
   private:
-    void loadFromFile()
-    {
-        std::string text;
-        const char* candidates[] = {
-            "sdmc:/switch/nx-downloader/url.txt",
-            "sdmc:/switch/nx-downloader/settings.txt",
-        };
-
-        for (const char* path : candidates)
-        {
-            if (!fsx::readWholeFile(path, &text))
-                continue;
-
-            // settings.txt 里可能带 "url=" 前缀
-            for (const std::string& line : splitLines(text))
-            {
-                std::string value = trim(line);
-                if (value.empty())
-                    continue;
-                if (value.compare(0, 4, "url=") == 0)
-                    value = trim(value.substr(4));
-                if (value.compare(0, 1, "#") == 0)
-                    continue;
-                if (Downloader::isSupportedUrl(value))
-                {
-                    this->setValue(value, false);
-                    Application::notify("已载入链接");
-                    return;
-                }
-            }
-        }
-
-        Application::notify("没找到可用链接（可写入 sdmc:/switch/nx-downloader/url.txt）");
-    }
-
-    static std::vector<std::string> splitLines(const std::string& text)
-    {
-        std::vector<std::string> lines;
-        std::string current;
-
-        for (char c : text)
-        {
-            if (c == '\n')
-            {
-                lines.push_back(current);
-                current.clear();
-            }
-            else if (c != '\r')
-            {
-                current.push_back(c);
-            }
-        }
-
-        if (!current.empty())
-            lines.push_back(current);
-
-        return lines;
-    }
+    std::string url;
+    std::string placeholder;
 };
 
-/// 周期性把下载进度刷到 UI 上的任务（必须由 UI 线程执行）
-class DownloadPollTask : public RepeatingTask
+//=====================================================================
+// 一行：输入框 + 文件图标 (+ 目录图标) + 访问按钮
+//=====================================================================
+
+class InputRow : public BoxLayout
 {
   public:
-    DownloadPollTask(Downloader* downloader, DownloadProgressDialog* dialog, MainView* view)
+    /// withFolderButton：只有「下载」行才需要选保存目录的图标
+    InputRow(const std::string& labelText, const std::string& placeholder, bool withFolderButton)
+        : BoxLayout(BoxLayoutOrientation::HORIZONTAL)
+    {
+        const unsigned h = listItemHeight();
+
+        this->setHeight(h);
+        this->setSpacing(h / 6);
+
+        // 顺序就是左右顺序。输入框排最前，宽度在 layout() 里根据剩余空间算。
+        this->input = new UrlInputItem(labelText, placeholder);
+        this->addView(this->input);
+
+        this->fileButton = new Button(ButtonStyle::REGULAR);
+        this->fileButton->setImage(BOREALIS_ASSET("icon/txt.png"));
+        this->addView(this->fileButton);
+
+        if (withFolderButton)
+        {
+            this->folderButton = new Button(ButtonStyle::REGULAR);
+            this->folderButton->setImage(BOREALIS_ASSET("icon/folder.png"));
+            this->addView(this->folderButton);
+        }
+
+        this->goButton = new Button(ButtonStyle::PRIMARY);
+        this->goButton->setLabel("访问");
+        this->addView(this->goButton);
+    }
+
+    void layout(NVGcontext* vg, Style* style, FontStash* stash) override
+    {
+        const unsigned h   = this->getHeight();
+        const unsigned gap = this->getSpacing();
+
+        // 图标按钮做成正方形，访问按钮稍宽（按行高成比例，跟着系统 UI 缩放走）
+        const unsigned iconWidth = h;
+        const unsigned goWidth   = h * 2;
+
+        const unsigned count = static_cast<unsigned>(this->getViewsCount());
+        unsigned fixed       = iconWidth + goWidth + gap * (count > 0 ? count - 1 : 0);
+        if (this->folderButton != nullptr)
+            fixed += iconWidth;
+
+        const unsigned total = this->getWidth();
+        const unsigned inputWidth = (total > fixed + 200) ? (total - fixed) : 200;
+
+        // BoxLayout 的水平布局用的是各子视图「已存」的宽度，
+        // 所以必须在调基类之前把宽度都定下来。
+        this->input->setWidth(inputWidth);
+        this->fileButton->setWidth(iconWidth);
+        if (this->folderButton != nullptr)
+            this->folderButton->setWidth(iconWidth);
+        this->goButton->setWidth(goWidth);
+
+        BoxLayout::layout(vg, style, stash);
+    }
+
+    UrlInputItem* input  = nullptr;
+    Button* fileButton   = nullptr;
+    Button* folderButton = nullptr;
+    Button* goButton     = nullptr;
+};
+
+namespace
+{
+
+//=====================================================================
+// 轮询任务：把工作线程的进度搬到 UI 上
+//=====================================================================
+
+class TaskPollTask : public RepeatingTask
+{
+  public:
+    TaskPollTask(Downloader* downloader, DownloadProgressDialog* dialog, MainView* view)
         : RepeatingTask(100)
         , downloader(downloader)
         , dialog(dialog)
@@ -169,7 +329,7 @@ class DownloadPollTask : public RepeatingTask
             return;
         }
 
-        // 进入终态：先把最后一帧刷新完，再把手里的指针取出来
+        // 进入终态：先把最后一帧刷新完，再把要用的指针取出来
         DownloadProgressDialog* dialog = this->dialog;
         MainView* view                 = this->view;
 
@@ -180,13 +340,39 @@ class DownloadPollTask : public RepeatingTask
         this->stop();
 
         if (view != nullptr)
-            view->onDownloadFinished();
+            view->onTaskFinished();
     }
 
   private:
     Downloader* downloader;
     DownloadProgressDialog* dialog;
     MainView* view;
+};
+
+//=====================================================================
+// 更新内容的展示页（可滚动）
+//=====================================================================
+
+class ResultView : public List
+{
+  public:
+    ResultView(const std::string& subtitle, const std::string& body)
+        : List()
+    {
+        this->registerAction("返回", Key::B, [] {
+            Application::popView();
+            return true;
+        });
+
+        this->addView(new Header("服务器返回内容", true, subtitle));
+
+        Label* content = new Label(LabelStyle::DESCRIPTION,
+            body.empty() ? "（服务器返回了空内容）" : body, true);
+        this->addView(content);
+
+        Label* tip = new Label(LabelStyle::DESCRIPTION, "按 B 返回", true);
+        this->addView(tip);
+    }
 };
 
 } // namespace
@@ -199,156 +385,232 @@ MainView::MainView(Downloader* downloader)
     : List()
     , downloader(downloader)
 {
-    // 先读设置（此时还没有控件，所以只把值取出来）
-    std::string savedUrl;
-    std::string savedDir;
-    this->readSettings(&savedUrl, &savedDir);
+    // 控件还没建，先从 settings.txt 把上次的值取出来暂存
+    this->readSettings();
 
-    if (!savedDir.empty())
-        this->downloadDir = fsx::normalize(savedDir);
+    if (!this->savedDir.empty())
+        this->outputDir = fsx::normalize(this->savedDir);
 
-    this->addView(new Header("NX Downloader", true, "粘贴直链 → 选择目录 → 开始下载"));
+    this->addView(new Header("NX Downloader", true, "上行检查更新 · 下行下载文件"));
 
-    // 1. 链接输入框
-    this->urlItem = new UrlInputItem();
-    this->addView(this->urlItem);
+    this->buildRows();
 
-    // 2. 保存目录按钮（带文件夹图标）
-    this->pathButton = new Button(ButtonStyle::REGULAR);
-    this->pathButton->setImage(BOREALIS_ASSET("icon/folder.png"));
-    this->pathButton->setLabel("保存到：" + this->downloadDir);
-    this->pathButton->setHeight(listItemHeight());
-    this->pathButton->getClickEvent()->subscribe([this](View*) {
-        this->openPathPicker();
-    });
-    this->addView(this->pathButton);
-
-    // 3. 下载按钮
-    this->downloadButton = new Button(ButtonStyle::PRIMARY);
-    this->downloadButton->setLabel("开始下载");
-    this->downloadButton->setHeight(listItemHeight() + listItemHeight() / 3);
-    this->downloadButton->getClickEvent()->subscribe([this](View*) {
-        this->startDownload();
-    });
-    this->addView(this->downloadButton);
+    // 保存目录状态行（不是控制行，只是把当前目录显示出来）
+    this->dirLabel = new Label(LabelStyle::DESCRIPTION,
+        "下载保存到：" + this->outputDir + "（点第二行的文件夹图标可更换）", true);
+    this->addView(this->dirLabel);
 
     Label* tip = new Label(LabelStyle::DESCRIPTION,
-        "提示：按 A 打开系统键盘输入链接，按 X 可从 sdmc:/switch/nx-downloader/url.txt 读取。"
-        "\nApplet 模式下系统键盘可能无法调起，此时请按住 R 键从游戏图标启动本程序（完整内存模式）。",
+        "A 输入链接（最长 100 字符）· X 直接读取 " + std::string(appcfg::URL_FILE) +
+            " 里对应的值 · 文件图标可挑选任意 .txt\n"
+            "Applet 模式（从相册启动）下系统键盘可能打不开，此时请用 X 或文件图标读取；"
+            "也可按住 R 键从游戏图标启动以获得完整内存模式。",
         true);
     this->addView(tip);
 
-    // 控件都建好之后再回填上次保存的链接
-    if (!savedUrl.empty() && Downloader::isSupportedUrl(savedUrl))
-        this->urlItem->setValue(savedUrl, false);
+    // 控件都建好之后再回填上次保存的内容
+    if (!this->savedUpdate.empty())
+        this->updateRow->input->setText(appcfg::normalizeUrl(this->savedUpdate));
+    if (!this->savedDownload.empty())
+        this->downloadRow->input->setText(appcfg::normalizeUrl(this->savedDownload));
 }
 
 MainView::~MainView() = default;
 
-//------------------------------ 设置持久化 ------------------------------//
+//------------------------------ 界面搭建 ------------------------------//
 
-void MainView::readSettings(std::string* url, std::string* dir) const
+void MainView::buildRows()
 {
-    if (url != nullptr)
-        url->clear();
-    if (dir != nullptr)
-        dir->clear();
+    //=========================== 第一行：检查更新 ===========================//
+    this->updateRow = new InputRow("更新链接", "按 A 输入检查更新的链接（可留空）", false);
+    this->addView(this->updateRow);
 
-    std::string text;
-    if (!fsx::readWholeFile(SETTINGS_PATH, &text))
-        return;
+    //=========================== 第二行：下载文件 ===========================//
+    this->downloadRow = new InputRow("下载链接", "按 A 输入要下载的文件直链", true);
+    this->addView(this->downloadRow);
 
-    std::string line;
-    for (size_t i = 0; i <= text.size(); i++)
-    {
-        if (i == text.size() || text[i] == '\n')
-        {
-            std::string entry = trim(line);
-            line.clear();
+    // 每行的输入框改动后都落盘
+    const auto saveHook = [this] { this->saveSettings(); };
+    this->updateRow->input->onChange   = saveHook;
+    this->downloadRow->input->onChange = saveHook;
 
-            if (entry.compare(0, 4, "url=") == 0)
-            {
-                if (url != nullptr)
-                    *url = trim(entry.substr(4));
-            }
-            else if (entry.compare(0, 4, "dir=") == 0)
-            {
-                if (dir != nullptr)
-                    *dir = trim(entry.substr(4));
-            }
+    // X 键绑定在「行」上：焦点在该行的任意控件（输入框 / 图标 / 访问按钮）时都生效
+    this->updateRow->registerAction("读 url.txt", Key::X, [this] {
+        this->loadFromProjectUrlFile(true);
+        return true;
+    });
 
-            continue;
-        }
+    this->downloadRow->registerAction("读 url.txt", Key::X, [this] {
+        this->loadFromProjectUrlFile(false);
+        return true;
+    });
 
-        line.push_back(text[i]);
-    }
+    this->updateRow->fileButton->getClickEvent()->subscribe([this](View*) {
+        this->openTextFilePicker(true);
+    });
+
+    this->downloadRow->fileButton->getClickEvent()->subscribe([this](View*) {
+        this->openTextFilePicker(false);
+    });
+
+    this->downloadRow->folderButton->getClickEvent()->subscribe([this](View*) {
+        this->openOutputDirPicker();
+    });
+
+    this->updateRow->goButton->getClickEvent()->subscribe([this](View*) {
+        this->startUpdateCheck();
+    });
+
+    this->downloadRow->goButton->getClickEvent()->subscribe([this](View*) {
+        this->startDownload();
+    });
 }
 
-void MainView::saveSettings() const
+//------------------------------ 文件 / 目录选择 ------------------------------//
+
+void MainView::openTextFilePicker(bool forUpdate)
 {
-    if (this->urlItem == nullptr)
-        return;
+    // 默认从项目文件夹开始找，那里就放着自动生成的 url.txt
+    const std::string startPath = fsx::isDirectory(appcfg::PROJECT_DIR) ? appcfg::PROJECT_DIR : "sdmc:/";
 
-    const std::string url = stripLineBreaks(this->urlItem->getValue());
-
-    std::string data;
-    data += "# NX Downloader 设置（可以直接改，也可以在界面里改）\n";
-    data += "url=" + url + "\n";
-    data += "dir=" + this->downloadDir + "\n";
-
-    if (!fsx::ensureDirectory(SETTINGS_DIR))
-        return;
-
-    fsx::writeWholeFile(SETTINGS_PATH, data);
-}
-
-//------------------------------ 目录选择 ------------------------------//
-
-void MainView::setDownloadDir(const std::string& path, bool persist)
-{
-    this->downloadDir = fsx::normalize(path);
-
-    if (this->pathButton != nullptr)
-        this->pathButton->setLabel("保存到：" + this->downloadDir);
-
-    if (persist)
-        this->saveSettings();
-
-    Application::notify("保存目录：" + this->downloadDir);
-}
-
-void MainView::openPathPicker()
-{
-    PathPickerView* picker = new PathPickerView(this->downloadDir, [this](const std::string& path) {
-        this->setDownloadDir(path, true);
+    TextFilePickerView* picker = new TextFilePickerView(startPath, [this, forUpdate](const std::string& path) {
+        this->loadFromFile(forUpdate, path);
     });
 
     Application::pushView(picker);
 }
 
-//------------------------------ 下载流程 ------------------------------//
-
-void MainView::showMessage(const std::string& title, const std::string& text)
+void MainView::openOutputDirPicker()
 {
-    Dialog* dialog = new Dialog(title + "\n\n" + text);
-
-    dialog->addButton("好的", [dialog](View*) {
-        dialog->close();
+    PathPickerView* picker = new PathPickerView(this->outputDir, [this](const std::string& path) {
+        this->setOutputDir(path, true);
     });
 
-    dialog->open();
+    Application::pushView(picker);
 }
 
-void MainView::startDownload()
+void MainView::setOutputDir(const std::string& path, bool persist)
+{
+    this->outputDir = fsx::normalize(path);
+
+    if (this->dirLabel != nullptr)
+        this->dirLabel->setText("下载保存到：" + this->outputDir + "（点第二行的文件夹图标可更换）");
+
+    if (persist)
+        this->saveSettings();
+
+    Application::notify("保存目录：" + this->outputDir);
+}
+
+//------------------------------ 从 url.txt / 任意 txt 取值 ------------------------------//
+
+bool MainView::loadFromFile(bool forUpdate, const std::string& filePath)
+{
+    std::string text;
+    if (!fsx::readWholeFile(filePath, &text))
+    {
+        this->showMessage("读不到文件", "无法读取：\n" + filePath);
+        return false;
+    }
+
+    appcfg::UrlEntry entry;
+
+    // 带上输入框里已有的内容：文件里只写了其中一项时，另一项不会被清空
+    entry.update   = this->updateRow->input->text();
+    entry.download = this->downloadRow->input->text();
+
+    if (!appcfg::parseUrlFile(text, &entry))
+    {
+        this->showMessage("解析失败",
+            "没有从文件里找到 updata / download。\n\n文件：\n" + filePath +
+                "\n\n期望格式：\n{ updata: 链接1 , download: 链接2 }");
+        return false;
+    }
+
+    if (forUpdate)
+    {
+        if (entry.update.empty())
+        {
+            this->showMessage("文件里没有 updata", "这个文件里没有可用于检查更新的链接。\n\n" + filePath);
+            return false;
+        }
+
+        this->updateRow->input->setText(entry.update);
+        Application::notify("已读取 updata");
+    }
+    else
+    {
+        if (entry.download.empty())
+        {
+            this->showMessage("文件里没有 download", "这个文件里没有可用于下载的链接。\n\n" + filePath);
+            return false;
+        }
+
+        this->downloadRow->input->setText(entry.download);
+        Application::notify("已读取 download");
+    }
+
+    this->saveSettings();
+    return true;
+}
+
+bool MainView::loadFromProjectUrlFile(bool forUpdate)
+{
+    if (this->downloader != nullptr && this->downloader->running())
+        return false;
+
+    return this->loadFromFile(forUpdate, appcfg::URL_FILE);
+}
+
+//------------------------------ 任务启动 ------------------------------//
+
+void MainView::setButtonsEnabled(bool enabled)
+{
+    const ButtonState state = enabled ? ButtonState::ENABLED : ButtonState::DISABLED;
+
+    const auto apply = [state](const InputRow* row) {
+        if (row == nullptr)
+            return;
+
+        row->goButton->setState(state);
+        row->fileButton->setState(state);
+
+        if (row->folderButton != nullptr)
+            row->folderButton->setState(state);
+    };
+
+    apply(this->updateRow);
+    apply(this->downloadRow);
+}
+
+void MainView::beginTask(Task kind, const std::string& title)
+{
+    this->task = kind;
+    this->setButtonsEnabled(false);
+
+    this->progressDialog = new DownloadProgressDialog(title, [this] {
+        // 「取消」按钮：只是请求取消，真正的收尾交给轮询任务
+        if (this->downloader != nullptr)
+            this->downloader->requestCancel();
+    });
+
+    this->progressDialog->open();
+
+    this->pollTask = new TaskPollTask(this->downloader, this->progressDialog, this);
+    this->pollTask->start();
+}
+
+void MainView::startUpdateCheck()
 {
     if (this->downloader == nullptr)
         return;
 
-    const std::string url = trim(this->urlItem->getValue());
+    const std::string url = appcfg::normalizeUrl(trim(this->updateRow->input->text()));
 
     if (url.empty())
     {
-        this->showMessage("还没有链接", "请先按 A 输入一个 http/https 直链。");
+        this->showMessage("还没有链接",
+            "请按 A 手动输入，或按 X 直接读取 " + std::string(appcfg::URL_FILE) + " 里的 updata。");
         return;
     }
 
@@ -360,27 +622,65 @@ void MainView::startDownload()
 
     if (this->downloader->running())
     {
-        this->showMessage("正在下载", "请等待当前下载结束，或先在上一个对话框里点「取消」。");
+        this->showMessage("正在忙", "请等当前任务结束，或先在上一个对话框里点「取消」。");
         return;
     }
 
-    // 先落盘保存，方便下次启动时保留
+    this->updateRow->input->setText(url);
+    this->saveSettings();
+
+    if (!this->downloader->startFetchText(url))
+    {
+        this->showMessage("无法开始", "请检查链接是否正确。");
+        return;
+    }
+
+    this->beginTask(Task::Update, "正在检查更新…");
+}
+
+void MainView::startDownload()
+{
+    if (this->downloader == nullptr)
+        return;
+
+    const std::string url = appcfg::normalizeUrl(trim(this->downloadRow->input->text()));
+
+    if (url.empty())
+    {
+        this->showMessage("还没有链接",
+            "请按 A 手动输入，或按 X 直接读取 " + std::string(appcfg::URL_FILE) + " 里的 download。");
+        return;
+    }
+
+    if (!Downloader::isSupportedUrl(url))
+    {
+        this->showMessage("链接无效", "只支持 http:// 与 https:// 开头的链接。\n\n当前内容：\n" + url);
+        return;
+    }
+
+    if (this->downloader->running())
+    {
+        this->showMessage("正在忙", "请等当前任务结束，或先在上一个对话框里点「取消」。");
+        return;
+    }
+
+    this->downloadRow->input->setText(url);
     this->saveSettings();
 
     std::string fileName = fsx::fileNameFromUrl(url);
     if (fileName.empty())
         fileName = "download.bin";
 
-    const std::string target = fsx::join(this->downloadDir, fileName);
+    const std::string target = fsx::join(this->outputDir, fileName);
 
     if (fsx::exists(target))
     {
         Dialog* dialog = new Dialog("目标文件已存在，是否覆盖？\n\n" + target);
 
-        dialog->addButton("覆盖", [this, dialog, url, fileName](View*) {
-            // 必须等对话框真正出栈之后再压入新视图，否则会搞乱视图栈
-            dialog->close([this, url, fileName]() {
-                this->beginDownload(url, fileName);
+        dialog->addButton("覆盖", [this, dialog, url](View*) {
+            // popView / pushView 是异步动画，必须等对话框真正出栈再继续
+            dialog->close([this, url]() {
+                this->beginDownload(url);
             });
         });
 
@@ -392,44 +692,94 @@ void MainView::startDownload()
         return;
     }
 
-    this->beginDownload(url, fileName);
+    this->beginDownload(url);
 }
 
-void MainView::beginDownload(const std::string& url, const std::string& fileName)
+void MainView::beginDownload(const std::string& url)
 {
-    if (!fsx::ensureDirectory(this->downloadDir))
+    if (!fsx::ensureDirectory(this->outputDir))
     {
-        this->showMessage("保存目录不可用", "无法创建或访问目录：\n" + this->downloadDir);
+        this->showMessage("保存目录不可用", "无法创建或访问目录：\n" + this->outputDir);
         return;
     }
 
-    if (!this->downloader->start(url, this->downloadDir))
+    std::string fileName = fsx::fileNameFromUrl(url);
+    if (fileName.empty())
+        fileName = "download.bin";
+
+    if (!this->downloader->start(url, this->outputDir))
     {
         this->showMessage("无法开始下载", "请检查链接与保存目录是否正确。");
         return;
     }
 
-    this->downloadButton->setState(ButtonState::DISABLED);
-
-    this->progressDialog = new DownloadProgressDialog(fileName, [this] {
-        // 「取消」按钮 / 只是请求取消，真正的收尾交给轮询任务
-        if (this->downloader != nullptr)
-            this->downloader->requestCancel();
-    });
-
-    this->progressDialog->open();
-
-    this->pollTask = new DownloadPollTask(this->downloader, this->progressDialog, this);
-    this->pollTask->start();
+    this->beginTask(Task::Download, fileName);
 }
 
-void MainView::onDownloadFinished()
+//------------------------------ 任务收尾 ------------------------------//
+
+void MainView::onTaskFinished()
 {
     if (this->downloader == nullptr)
         return;
 
-    const Downloader::State state = this->downloader->state();
+    const Downloader::State state  = this->downloader->state();
+    DownloadProgressDialog* dialog = this->progressDialog;
 
+    this->progressDialog = nullptr;
+    this->pollTask       = nullptr; // 任务由 borealis 的任务管理器自行回收
+
+    this->setButtonsEnabled(true);
+
+    const Task kind = this->task;
+    this->task      = Task::None;
+
+    //========================= 检查更新 =========================//
+    if (kind == Task::Update)
+    {
+        if (state == Downloader::State::Finished)
+        {
+            const std::string body = capText(this->downloader->bodyText(), MAX_RESULT_DISPLAY);
+
+            Application::notify("检查完成（HTTP " + std::to_string(this->downloader->httpStatus()) + "）");
+
+            ResultView* result = new ResultView(this->downloader->finalUrl(), body);
+
+            if (dialog != nullptr)
+                dialog->close([result] { Application::pushView(result); });
+            else
+                Application::pushView(result);
+
+            return;
+        }
+
+        std::string title = "检查更新失败";
+        std::string text  = this->downloader->errorText();
+
+        if (state == Downloader::State::Cancelled)
+        {
+            title = "已取消";
+            text  = "检查更新已取消。";
+        }
+        else if (!this->downloader->bodyText().empty())
+        {
+            // 有些服务器在 4xx/5xx 里也返回有用的说明，一并带出来
+            text += "\n\n服务器返回：\n" +
+                    capText(this->downloader->bodyText(), MAX_RESULT_DISPLAY);
+        }
+
+        if (text.empty())
+            text = "未知错误。";
+
+        if (dialog != nullptr)
+            dialog->close([this, title, text] { this->showMessage(title, text); });
+        else
+            this->showMessage(title, text);
+
+        return;
+    }
+
+    //========================= 下载文件 =========================//
     std::string title;
     std::string text;
 
@@ -442,7 +792,7 @@ void MainView::onDownloadFinished()
 
             if (!this->downloader->tlsVerified())
                 text += "\n\n⚠ 本次连接未校验证书（设备上没有可用的 CA 证书）。"
-                        "如果要严格校验，可把 cacert.pem 放到 sdmc:/switch/nx-downloader/ 下。";
+                        "如需严格校验，可把 cacert.pem 放到 " + std::string(appcfg::PROJECT_DIR) + "/ 下。";
 
             Application::notify("下载完成：" + this->downloader->fileName());
             break;
@@ -459,28 +809,83 @@ void MainView::onDownloadFinished()
         {
             title = "下载失败";
             text  = this->downloader->errorText();
+
             if (text.empty())
-                text = "未知错误（可打开日志查看详情）。";
+                text = "未知错误（可连接电脑查看 SD 卡上的文件确认）。";
+
             break;
         }
     }
 
-    DownloadProgressDialog* dialog = this->progressDialog;
-
-    this->progressDialog = nullptr;
-    this->pollTask       = nullptr; // 任务由 borealis 的任务管理器自行回收
-
-    if (this->downloadButton != nullptr)
-        this->downloadButton->setState(ButtonState::ENABLED);
-
-    if (dialog == nullptr)
-    {
+    if (dialog != nullptr)
+        dialog->close([this, title, text] { this->showMessage(title, text); });
+    else
         this->showMessage(title, text);
-        return;
-    }
+}
 
-    // 关掉进度对话框之后再弹结果提示（popView 是异步动画，必须用回调串起来）
-    dialog->close([this, title, text]() {
-        this->showMessage(title, text);
+//------------------------------ 通用 ------------------------------//
+
+void MainView::showMessage(const std::string& title, const std::string& text)
+{
+    Dialog* dialog = new Dialog(title + "\n\n" + text);
+
+    dialog->addButton("好的", [dialog](View*) {
+        dialog->close();
     });
+
+    dialog->open();
+}
+
+//------------------------------ 设置持久化 ------------------------------//
+
+void MainView::readSettings()
+{
+    this->savedUpdate.clear();
+    this->savedDownload.clear();
+    this->savedDir.clear();
+
+    std::string text;
+    if (!fsx::readWholeFile(appcfg::SETTINGS_FILE, &text))
+        return;
+
+    const auto takeValue = [](const std::string& entry, const char* key, std::string* out) {
+        const size_t length = std::strlen(key);
+        if (entry.size() >= length && entry.compare(0, length, key) == 0)
+            *out = trim(entry.substr(length));
+    };
+
+    std::string line;
+    for (size_t i = 0; i <= text.size(); i++)
+    {
+        if (i == text.size() || text[i] == '\n')
+        {
+            const std::string entry = trim(line);
+            line.clear();
+
+            takeValue(entry, "update=", &this->savedUpdate);
+            takeValue(entry, "download=", &this->savedDownload);
+            takeValue(entry, "dir=", &this->savedDir);
+
+            continue;
+        }
+
+        line.push_back(text[i]);
+    }
+}
+
+void MainView::saveSettings() const
+{
+    if (this->updateRow == nullptr || this->downloadRow == nullptr)
+        return;
+
+    std::string data;
+    data += "# NX Downloader 设置（界面里改过之后会自动写回这里）\n";
+    data += "update=" + this->updateRow->input->text() + "\n";
+    data += "download=" + this->downloadRow->input->text() + "\n";
+    data += "dir=" + this->outputDir + "\n";
+
+    if (!fsx::ensureDirectory(appcfg::PROJECT_DIR))
+        return;
+
+    fsx::writeWholeFile(appcfg::SETTINGS_FILE, data);
 }

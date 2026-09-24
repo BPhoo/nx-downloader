@@ -21,13 +21,13 @@ namespace
 // 内容视图
 //=====================================================================
 
-DownloadProgressContent::DownloadProgressContent(const std::string& fileName)
+DownloadProgressContent::DownloadProgressContent(const std::string& title)
     : BoxLayout(BoxLayoutOrientation::VERTICAL)
 {
     this->setResize(true);
     this->setSpacing(24);
 
-    this->nameLabel = new Label(LabelStyle::DIALOG, fileName, true);
+    this->nameLabel = new Label(LabelStyle::DIALOG, title, true);
     this->nameLabel->setHorizontalAlign(NVG_ALIGN_CENTER);
     this->addView(this->nameLabel);
 
@@ -59,9 +59,9 @@ void DownloadProgressContent::setProgress(int percent)
 // 对话框
 //=====================================================================
 
-DownloadProgressDialog::DownloadProgressDialog(const std::string& fileName, std::function<void()> onCancelRequested)
+DownloadProgressDialog::DownloadProgressDialog(const std::string& title, std::function<void()> onCancelRequested)
 {
-    this->content = new DownloadProgressContent(fileName);
+    this->content = new DownloadProgressContent(title);
     this->dialog  = new Dialog(this->content);
 
     this->dialog->addButton("取消", [onCancelRequested](View*) {

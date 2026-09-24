@@ -1,247 +1,174 @@
-# NX Downloader —— 构建说明（生成 .nro）
+# NX Downloader —— 构建与部署说明
 
-本文档说明如何把本工程编译成 Switch 可运行的 `nx-downloader.nro`。
-
----
-
-## 0. 工程结构
-
-```
-nx-downloader/
-├── Makefile                 构建入口（devkitPro 标准模板 + borealis + curl）
-├── icon.jpg                 256x256 应用图标，会被打包进 .nro
-├── source/
-│   ├── main.cpp             入口：初始化各子系统、挂中文字体、跑 UI 主循环
-│   ├── main_view.hpp/.cpp   主界面：输入框 / 目录按钮 / 下载按钮 + 完成提示
-│   ├── path_picker.hpp/.cpp 目录选择器（浏览 SD 卡子目录）
-│   ├── progress_dialog.hpp/.cpp 下载进度对话框（进度条 + 取消）
-│   ├── downloader.hpp/.cpp  下载引擎（libcurl + 工作线程）
-│   └── fsx.hpp/.cpp         SD 卡文件系统与路径工具
-└── romfs/                   会被打进 .nro 的资源
-    ├── icon/folder.png      「选择目录」按钮上的文件夹图标
-    ├── i18n/en-US/brls.json borealis 界面文案（OK/Back/Exit）
-    └── material/            图标字体（borealis 运行时加载）
-```
+Nintendo Switch 自制程序（`.nro`）：上行检查更新、下行下载文件，全部基于
+**devkitPro/libnx + borealis + libcurl** 实现。
 
 ---
 
-## 1. 前置环境：devkitPro
-
-Switch 自制程序必须用 **devkitPro** 的工具链（`aarch64-none-elf-gcc`），
-不能直接用系统里的 MinGW / MSVC / 普通 gcc。
-
-### 1.0 ⚠️ 先做一个网络前置检查（很多人卡在这里）
-
-devkitPro 的安装器和 `dkp-pacman` 都要从 **`https://pkg.devkitpro.org`** 下载包。
-这个站点挂在 Cloudflare 后面，**会按地区/ASN 直接返回 403**
-（devkitPro 官方 issue [devkitPro/pacman#31](https://github.com/devkitPro/pacman/issues/31)
-确认过，属于已知的上游地域封锁，不是本机网络故障）。
-
-先测一下通不通：
-
-```bash
-curl -o /dev/null -w "%{http_code}\n" https://pkg.devkitpro.org/devkitpro-keyring.pkg.tar.zst
-```
-
-- 返回 `200` → 正常，直接往下走。
-- 返回 `403` → **先解决网络再装**，否则安装器会在「下载包」那一步失败：
-  - 挂代理 / 开 VPN（中国大陆用户最常见的情况）；
-  - 或换个出口网络（比如手机热点换另一家运营商）后再复测；
-  - 装了代理后，让 pacman 走代理（见 1.3）；
-  - **装不了或不想折腾 → 直接跳到 §10「云编译」，本机一行命令都不用装。**
-
-### 1.1 安装
-
-1. 从 <https://github.com/devkitPro/installer/releases> 下载 **Windows 安装器**并安装，
-   默认装到 `C:\devkitPro`。
-   安装器是联网安装的（本体只有 190 KB，包是安装时下载），记得勾选
-   **"Switch Development"**（devkitA64 + libnx）。
-2. 安装完成后，从开始菜单打开 **"devkitPro MSYS2 Shell"**
-   （或直接运行 `C:\devkitPro\msys2.exe`）。
-   **后续所有命令都在这个 shell 里执行**，否则 `DEVKITPRO` 变量不存在，`make` 会直接报错。
-
-### 1.2 验证安装
-
-```bash
-echo "$DEVKITPRO"          # 应输出 /opt/devkitpro
-which aarch64-none-elf-gcc # 应输出 /opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc
-which curl-config          # 应输出 /opt/devkitpro/portlibs/switch/bin/curl-config
-```
-
-### 1.3 让 pacman 走代理（仅当 1.0 返回 403 且你有代理时）
-
-pacman 底层是 libcurl，直接认环境变量。假设本地 HTTP 代理在 `127.0.0.1:7890`：
-
-```bash
-export http_proxy=http://127.0.0.1:7890
-export https_proxy=http://127.0.0.1:7890
-```
-
-SOCKS5 也可以：`export all_proxy=socks5h://127.0.0.1:1080`。
-想长期生效就写进 `~/.bashrc`，或在 `/etc/pacman.conf` 里用 `XferCommand` 指定。
-
-## 2. 安装依赖包
-
-在 devkitPro MSYS2 Shell 里执行：
-
-```bash
-dkp-pacman -S --needed switch-dev switch-curl
-```
-
-- `switch-dev`：libnx 与 `libnx/switch_rules`（Makefile 依赖它）
-- `switch-curl`：Switch 版 libcurl（底层是 mbedTLS，HTTPS 全靠它）
-
-`switch-curl` 会一并装上 `mbedtls`、`zlib`、`libssh2` 等传递依赖。
-本工程的 Makefile 用 `curl-config --libs` 自动展开这些依赖，不需要手工写 `-lmbedtls` 之类。
-
-## 3. 准备 borealis
-
-borealis 是界面库，本工程以源码形式引入（不预编译），源码放在工程根目录的 `borealis/`：
-
-```bash
-cd /path/to/nx-downloader
-git clone --depth=1 --recursive https://github.com/XITRIX/borealis.git borealis
-```
-
-> `borealis/` 目录不进版本库也没关系，它是外部依赖。
-
-## 4. 同步运行时资源
-
-borealis 运行时要读翻译文件与图标字体。执行一次即可：
-
-```bash
-make sync-resources
-```
-
-它会把 `borealis/resources/{i18n,material}` 拷进本工程的 `romfs/`。
-（`romfs/icon/folder.png` 是本工程自带的，不受影响。）
-
-## 5. 编译
-
-```bash
-make -j$(nproc)
-```
-
-成功后在工程根目录得到：
+## 1. 功能与界面
 
 ```
-nx-downloader.elf    中间文件（可忽略）
-nx-downloader.nacp   应用元信息
-nx-downloader.nro    ★ 这个就是要拷到 Switch 的文件
+┌──────────────────────────────────────────────────────────────────────┐
+│  NX Downloader                                                       │
+│  上行检查更新 · 下行下载文件                                          │
+├──────────────────────────────────────────────────────────────────────┤
+│  更新链接   [ https://example.com/version.txt      ]  [txt]  [ 访问 ] │
+│  下载链接   [ https://example.com/app.nro          ]  [txt] [dir] [访问] │
+├──────────────────────────────────────────────────────────────────────┤
+│  下载保存到：sdmc:/  （点第二行的文件夹图标可更换）                    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-从头重来：`make clean && make -j$(nproc)`
-
-### `.nro` 是怎么生成的？
-
-Makefile 最终调用 devkitPro 的 `elf2nro`：
-
-```
-nx-downloader.elf --nacp=nx-downloader.nacp --icon=icon.jpg --romfsdir=romfs → nx-downloader.nro
-```
-
-也就是说 `.nro` = **可执行代码（elf）+ 应用信息（nacp）+ 图标（icon.jpg）+ 资源（romfs/）**。
-
-## 6. 部署到 Switch
-
-1. 用读卡器把 SD 卡插到电脑（或通过 FTP / nxmtp 传输）。
-2. 在 SD 卡上建目录 `switch/nx-downloader/`，把 `nx-downloader.nro` 拷进去：
-
-```
-SD:/switch/nx-downloader/nx-downloader.nro
-```
-
-3. 把卡插回 Switch，进入 **相册（Album）** 或 **hbmenu**，运行 "NX Downloader"。
-
-## 7. 常见问题
-
-| 现象 | 原因 / 处理 |
+| 控件 | 说明 |
 | --- | --- |
-| 安装器走到「下载包」报 `403` / `failed retrieving file` | `pkg.devkitpro.org` 把你的出口 IP 拦了。见 1.0 与 1.3（挂代理或换网络） |
-| `Please set DEVKITPRO in your environment` | 没在 devkitPro MSYS2 Shell 里执行 `make` |
-| `borealis/library/borealis.mk: No such file` | 没做第 3 步，或目录名不是 `borealis` |
-| 图标 / 文件夹图片不显示 | 没做第 4 步 `make sync-resources` |
-| 运行后界面中文是方块 | 主机为英文/日文时系统标准字体不含汉字。程序会自动挂载系统内置简体中文字体；若仍异常，可检查日志中的 `简体中文字体加载失败` 提示 |
-| **按 A 打不开系统键盘** | Applet 模式（从相册启动）下系统软键盘可能调不起来。见下面第 8 节 |
-| 下载报证书错误 | 设备没有 CA 证书链。程序会自动降级为「不校验证书」重试一次并给出提示；如需严格校验，把 `cacert.pem` 放到 `SD:/switch/nx-downloader/` |
+| 第一行 输入框 | 检查更新用的链接。按 **A** 打开系统键盘手动输入（**最长 100 字符，无下限**） |
+| 第一行 [txt] | 打开 txt 选择器，选中文件后自动填入该文件里的 `updata` |
+| 第一行 [访问] | 访问该链接，把**服务器返回内容**显示在结果页（可滚动，B 返回） |
+| 第二行 输入框 | 下载用的链接，输入方式同上 |
+| 第二行 [txt] | 打开 txt 选择器，选中后自动填入该文件里的 `download` |
+| 第二行 [dir] | 选择下载保存目录（默认 **SD 卡根目录 `sdmc:/`**） |
+| 第二行 [访问] | 访问该链接并下载文件，带进度条 / 完成提示 / 错误提示 |
 
-## 8. Applet 模式 vs 完整内存模式
-
-从**相册**启动时，程序运行在 **Applet 模式**（内存受限），系统软键盘（swkbd）有可能调起失败。
-两种应对方式：
-
-1. **降级输入**：把链接写进文本文件，界面上按 **X** 键读取。
-   文件路径：`SD:/switch/nx-downloader/url.txt`（写一行链接即可）。
-2. **换成完整内存模式**：在主界面按住 **R** 键不放，再从游戏图标启动程序，
-   此时内存充足，系统键盘可正常使用。
-
-程序自己的设置也存放在 `SD:/switch/nx-downloader/settings.txt`，格式：
-
-```
-url=https://example.com/file.zip
-dir=sdmc:/downloads
-```
-
-## 9. 操作速查
+### 按键
 
 | 按键 | 作用 |
 | --- | --- |
-| A | 在当前控件上确认：输入框 → 打开系统键盘；目录按钮 → 进入目录选择器；下载按钮 → 开始下载 |
-| B | 返回上一屏（目录选择器内）／ 关闭可关闭的对话框 |
-| X | 在链接输入框上：从 `url.txt` 读取链接 |
-| + | 退出程序 |
+| `A` | 打开系统键盘输入链接；在列表里则是「进入 / 选择」 |
+| `X` | **快捷读取** `sdmc:/switch/nx-downloader/url.txt` 里对应的值（第一行读 `updata`，第二行读 `download`） |
+| `十字键` / **左摇杆** | 移动焦点（左右在同一行内切换，上下在行之间切换） |
+| `B` | 返回上一屏 |
+| `+` | 退出程序 |
+
+### 下载反馈
+* **进度**：模态对话框里显示百分比 + `已下载 / 总大小`
+* **完成提示**：通知横幅 + 弹窗显示最终文件路径
+* **错误提示**：弹窗显示具体原因（HTTP 4xx/5xx、证书、空间不足、写盘失败等）
+* **取消**：对话框上的「取消」按钮；取消/失败会**删掉半成品文件**，不留损坏文件
 
 ---
 
-## 10. 装不了 devkitPro 时：用 GitHub Actions 云编译（推荐）
+## 2. 项目结构
 
-如果你的网络被 `pkg.devkitpro.org` 403 拦住（见 §1.0），**本机不需要装任何工具链**。
-把工程推到 GitHub，让 GitHub 的服务器帮你编译，再从 Actions 页面下载 `.nro`。
-
-GitHub 的 runner 在美国/新加坡，不受 Cloudflare 地域封锁影响。
-本工程已经自带 workflow：`.github/workflows/build-nro.yml`，打开即用。
-
-### 10.1 步骤
-
-1. 在 <https://github.com/new> 新建一个仓库（**Public 即可，免费额度不限**；
-   私有仓库也行，每月 2000 分钟，一次编译只需几分钟）。
-2. 把 `nx-downloader/` 里的内容传上去，两种方式任选：
-   - **命令行**（本机 git 可用）：
-     ```bash
-     cd nx-downloader
-     git init && git add . && git commit -m "init"
-     git branch -M main
-     git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-     git push -u origin main
-     ```
-   - **纯网页**：在仓库首页点 "uploading an existing file"，把文件夹拖进去，然后 Commit。
-3. push 完成后，打开仓库的 **Actions** 标签页，会看到 `build-nro` 正在跑（约 3~8 分钟）。
-4. 跑完后，点进那次运行，在页面底部的 **Artifacts** 里下载 `nx-downloader-nro`
-   （里面是 `nx-downloader.nro` 和 `nx-downloader.elf`）。
-5. 把 `.nro` 拷到 `SD:/switch/nx-downloader/`（见 §6）。
-
-改了代码后重新 `git push`，Actions 会自动再编一次。
-
-### 10.2 为什么这样可行
-
-workflow 在 `ubuntu-latest` 上执行：
-
-```bash
-wget https://apt.devkitpro.org/install-devkitpro-pacman   # devkitPro 官方的 Debian 安装脚本
-sudo ./install-devkitpro-pacman
-sudo dkp-pacman -S --needed switch-dev switch-curl
-git clone --depth=1 --recursive https://github.com/XITRIX/borealis.git borealis
-make sync-resources && make -j$(nproc)
+```
+nx-downloader/
+├── Makefile                     devkitPro/libnx 标准模板 + borealis + curl-config
+├── icon.jpg                     256×256 JPEG，.nro 的图标
+├── .github/workflows/build-nro.yml   GitHub Actions 云编译
+├── romfs/                       会被打进 .nro，运行时通过 romfs:/ 访问
+│   ├── i18n/en-US/brls.json     底部按键提示等文案
+│   ├── icon/folder.png          「选保存目录」按钮的图标（128×128）
+│   ├── icon/txt.png             「选 txt 文件」按钮的图标（128×128）
+│   └── material/                Material 图标字体
+└── source/
+    ├── main.cpp                 初始化顺序 / 中文字体 fallback / 主循环
+    ├── app_config.hpp/.cpp      项目文件夹 + url.txt 的创建与宽松解析
+    ├── downloader.hpp/.cpp      libcurl 工作线程：落盘下载 + 文本拉取（两种模式）
+    ├── fsx.hpp/.cpp             libnx FsFileSystem 封装（读写、列目录、路径工具）
+    ├── main_view.hpp/.cpp       主界面（双行结构、自绘输入框、结果页）
+    ├── file_picker.hpp/.cpp     选择 .txt 文件的浏览视图
+    ├── path_picker.hpp/.cpp     选择保存目录的浏览视图
+    └── progress_dialog.hpp/.cpp 进度对话框
 ```
 
-等价于 §1~§5 的全部步骤，只是跑在别人的 Linux 服务器上。
-产物通过 `actions/upload-artifact` 带回给你。
+---
 
-### 10.3 其他备选（都不如云编译省事）
+## 3. SD 卡上的文件
 
-| 方案 | 说明 |
+程序启动时如果发现**项目文件夹不存在就创建**，并在里面生成 `url.txt` 模板：
+
+```
+sdmc:/switch/nx-downloader/
+├── nx-downloader.nro      程序本体
+├── url.txt                ← 启动时自动生成（格式见下）
+├── settings.txt           界面里改过的链接与保存目录（自动写回）
+└── cacert.pem             可选：放了它就严格校验 HTTPS 证书
+```
+
+`url.txt` 的内容：
+
+```text
+// NX Downloader 配置文件（直接用文本编辑器改就行，改完重启程序生效）
+// 第一项：检查更新用的链接，对应界面第一行的「访问」
+// 第二项：下载文件用的链接，对应界面第二行的「访问」
+// 链接可以省略 https:// ，程序会自动补上
+{
+    updata:   https://example.com/version.txt ,
+    download: https://example.com/app.nro
+}
+```
+
+解析做得很宽松，下面这些写法都认：
+
+* 键名大小写不敏感；`updata` 与 `update` 等价
+* 分隔符 `:` 或 `=` 都行，也可以不写
+* 值可以加单/双引号
+* `//`、`#`、`;` 开头的整行按注释忽略
+* 值里省略协议时自动补 `https://`（所以写 `example.com/a.nro` 也可以）
+* 换行、逗号分隔都行；`{` `}` 只是装饰，可以不加
+
+---
+
+## 4. 本地构建（需要 devkitPro）
+
+> ⚠️ 先做网络检查：`pkg.devkitpro.org` 挂在 Cloudflare 后面，部分地区会被**整站 403**，
+> 表现是 `dkp-pacman` 死活装不上包。若被拦，请直接看第 5 节走云编译。
+
+```bash
+# 在 devkitPro 的 MSYS2 Shell 里执行（不是普通 Git Bash）
+dkp-pacman -S --needed switch-dev switch-curl
+
+# 工程根目录下
+git clone --depth=1 --recursive -b master https://github.com/XITRIX/borealis.git borealis
+make sync-resources          # 把 borealis 的 i18n / material 资源同步进 romfs/
+make -j$(nproc)
+
+# 产物
+ls -lh nx-downloader.nro
+```
+
+拷到 SD 卡：`SD:/switch/nx-downloader/nx-downloader.nro`
+
+在 Switch 上从 **hbmenu** 启动，或**按住 R 键从任意游戏图标**启动（完整内存模式，
+Applet 模式下系统键盘可能打不开）。
+
+---
+
+## 5. 装不了 devkitPro？用 GitHub Actions 云编译
+
+本机零安装：把工程推到 GitHub，让 runner 编译，再从 Actions 页面下载 Artifacts。
+
+`.github/workflows/build-nro.yml` 已经处理好这些坑：
+
+| 坑 | 处理方式 |
 | --- | --- |
-| **Cloudflare WARP** | 免费改出口 IP，`winget install --id Cloudflare.Warp`。改完 IP 后本机就能正常装 devkitPro，但它在国内不保证可用，且需要管理员权限、会动系统网络配置 |
-| **代理 / VPN** | 挂上后按 §1.3 给 pacman 配 `https_proxy`，本机正常装 |
-| **手工拼装工具链** | ARM 官方 Windows 原生 `aarch64-none-elf` 工具链可以下载（约 177 MB），但还要自己编译 libnx 与 switch-tools、自己准备 `make`、自己解决 Switch 版 libcurl，坑很多，**不建议** |
-| **国内镜像站** | 已实测：清华/中科大/阿里/腾讯/上交/南大/BFSU 都没有 devkitpro 镜像，别浪费时间 |
+| GitHub runner 访问 `apt.devkitpro.org` 同样被 Cloudflare 拦 | 探活失败时自动退到官方镜像 `devkitpro/devkita64`，编译在容器里跑 |
+| `XITRIX/borealis` 默认分支是 `moonlight_wiliwili`（结构不同） | 显式 `git clone -b master` |
+| `make` 1 秒结束、没有产物 | Makefile 里 `sync-resources` 排在 `all` 前面，GNU make 会把它当默认目标 → 显式 `.DEFAULT_GOAL := all` |
+| borealis(master) 用了新版 libnx 已删除的 `swkbdConfigSetStringLenMaxExt` | CI 里 sed 换成 `swkbdConfigSetStringLenMax` |
+| borealis(master) 左摇杆不能导航（源码里只有一句 TODO） | CI 里在 `application.cpp` 的 TODO 处注入左摇杆 → `Application::navigate()`（死区 0.5、180ms 重复、弹窗期间不生效） |
+
+触发方式：push 代码，或到 Actions 页面点 **Run workflow**。编译完在运行的 **Artifacts**
+区下载 `nx-downloader-nro.zip`，解压出 `nx-downloader.nro`。
+
+---
+
+## 6. 已知限制与排错
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| 中文显示成方块 | 程序已挂载系统简体中文字体作为 fallback；若主机系统字体缺失则无解 |
+| 从「相册」启动时 `A` 打不开键盘 | Applet 模式限制。改用 `X` / 文件图标读 `url.txt`，或按住 R 从游戏图标启动 |
+| HTTPS 报证书错误 | 设备上没有 CA 链时，程序会**自动降级为不校验证书**并在完成提示里注明；要严格校验就把 `cacert.pem` 放到项目文件夹 |
+| HTTP 404 也提示「下载失败」 | 这是刻意的：避免把服务器的错误页面当成文件存下来 |
+| 界面卡在进度框不动 | 网络太慢或服务器无响应，点「取消」；超时/低速阈值是 15s 连接、60s 低速 |
+| Windows Defender 报毒 | `.nro` 不是 Windows 可执行文件，正常情况下不会报；打包 zip 分发若被拦，加白名单即可 |
+| 点「访问」闪退 | 已修的两个历史崩溃：① 工作线程栈溢出（改用 `pthread` 显式 2 MiB 栈）；② `SocketInitConfig` 字段差异（用 SFINAE 兼容） |
+
+---
+
+## 7. 版本
+
+| 版本 | 说明 |
+| --- | --- |
+| 1.0.0 | 单行下载器：一个链接输入框 + 保存目录 + 下载按钮 |
+| **2.0.0** | 双行结构：上行检查更新（显示返回内容）、下行下载（可选目录、进度、完成/错误提示）；启动自动创建项目文件夹与 `url.txt`；`X` 快捷读取；两行各有 txt 选择图标；左摇杆可导航 |
