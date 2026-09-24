@@ -3,9 +3,6 @@
 #include <cstdio>
 #include <string>
 
-// bsdSocket / bsdClose：自检用。<switch.h> 并不包含这个头，必须显式带上。
-#include <switch/services/bsd.h>
-
 #include "logx.hpp"
 
 namespace netx
@@ -27,7 +24,6 @@ bool g_nifmOk      = false;
 Result g_nifmErr   = 0;
 Result g_socketErr = 0;
 Result g_retryErr  = 0;
-Result g_probeErr  = 0;
 
 std::string g_connText = "未查询";
 
@@ -60,24 +56,15 @@ void probeConnection()
         g_connText = std::string("未联网（") + typeText + "，状态码 " + std::to_string(static_cast<int>(status)) + "）";
 }
 
-/// socket 层可用性自检：开一个 TCP socket 再关掉。
-/// 只用来写日志、帮助判断，**不作为禁用联网的依据**（那种「凭一个返回码就把功能关掉」
-/// 的思路正是 v2.1.0 的错）。
+/// socket 层可用性自检。
+///
+/// 曾经想用 bsdSocket()/bsdClose() 开一个 TCP socket 来实测，但 libnx 4.12.0 的
+/// 库里**没有导出这两个符号**（编译会 undefined reference），所以改为只记录
+/// 初始化返回值 —— 真正的可用性由第一次实际请求（curl）的结果来体现，
+/// 那个结果在 downloader 里已经完整记进日志了。
 void probeSocketLayer()
 {
-    // AF_INET = 2, SOCK_STREAM = 1（Switch/newlib 的固定取值）
-    const int fd = bsdSocket(2, 1, 0);
-
-    if (fd < 0)
-    {
-        g_probeErr = socketGetLastResult();
-        logx::linef("socket 层自检：创建 TCP socket 失败（%s）", logx::result(g_probeErr).c_str());
-        return;
-    }
-
-    bsdClose(fd);
-    g_probeErr = 0;
-    logx::line("socket 层自检：能创建 TCP socket，网络层可用");
+    logx::line("socket 初始化返回值已记录；实际可用性看后续请求的日志");
 }
 
 } // namespace
@@ -95,11 +82,6 @@ Result retryError()
 Result nifmError()
 {
     return g_nifmErr;
-}
-
-Result probeError()
-{
-    return g_probeErr;
 }
 
 bool ready()

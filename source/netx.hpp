@@ -44,9 +44,6 @@ Result retryError();
 /// nifmInitialize 的错误码
 Result nifmError();
 
-/// socket 层自检（开一个 TCP socket）的错误码，0 表示自检通过
-Result probeError();
-
 /// 是否运行在「完整内存模式」（按住 R 从游戏图标启动）
 bool fullMemoryMode();
 
