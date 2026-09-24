@@ -3,6 +3,9 @@
 #include <cstdio>
 #include <string>
 
+// bsdSocket / bsdClose：自检用。<switch.h> 并不包含这个头，必须显式带上。
+#include <switch/services/bsd.h>
+
 #include "logx.hpp"
 
 namespace netx

@@ -149,32 +149,27 @@ jobs:
       - name: 6. 编译
         # 用 make -k（keep going）：即使某个 .cpp 编译失败也继续编译其余文件，
         # 这样一次 CI 就能把所有编译错误都暴露出来，不用一个个来回试。
-        # 完整日志写进 build.log，并在 Step Summary 里单独摘出所有 error: 行。
         #
-        # ⚠️ 固件 21.0.0 + Atmosphere 1.10.0 起，Nintendo 改了 userland 的 TLS ABI：
-        #    用旧版 libnx(<4.10.0) 编出来的 homebrew 会内存损坏，表现就是随机卡死/崩溃
-        #    （凡是用到线程、C++ 异常这类依赖 TLS 的东西都中招）。
-        #    所以这里在**同一个容器里**先把工具链升到最新再编译 ——
-        #    注意必须和编译在同一个 docker run 内，因为每个 docker run --rm 都是全新容器。
+        # ⚠️ 两个踩过的坑：
+        #   1) GitHub Actions 用的是 `bash -e`（日志里能看到 "shell: /usr/bin/bash -e {0}"）,
+        #      所以 make 一失败脚本就中断，下面的 $GITHUB_STEP_SUMMARY 根本不会写出来 ——
+        #      失败时反而看不到日志。因此这里给管道加 `|| echo` 兜底，保证摘要一定会生成。
+        #   2) 不要顺手在容器里 pacman -Su 升级工具链：镜像自带 libnx 4.12.0（≥4.10.0，
+        #      已满足固件 21.x 的 TLS ABI 要求），而升级会把 gcc 从 15 换到 16，
+        #      白白引入变量。只**打印**版本以便回溯即可。
         run: |
           set -o pipefail
           if [ "${{ steps.dkp.outputs.mode }}" = "native" ]; then
             export DEVKITPRO=/opt/devkitpro
             export PATH="/opt/devkitpro/tools/bin:$PATH"
             dkp-pacman -Q | grep -Ei "libnx|switch-dev|switch-curl" || true
-            make -k -j$(nproc) 2>&1 | tee build.log
+            make -k -j$(nproc) 2>&1 | tee build.log || echo "[warn] make 返回非 0（详见下方错误汇总）"
           else
             docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64:latest bash -lc '
-              echo "=== 镜像自带版本 ==="
-              dkp-pacman -Q 2>/dev/null | grep -Ei "libnx|switch-dev|switch-curl|devkitA64" || true
-              echo "=== 尝试升级到最新（失败就继续用自带版本）==="
-              dkp-pacman -Sy --noconfirm            >/tmp/upd.log 2>&1 || echo "[warn] -Sy 失败"
-              dkp-pacman -Su --noconfirm --overwrite="*" >>/tmp/upd.log 2>&1 || echo "[warn] -Su 失败"
-              tail -20 /tmp/upd.log
-              echo "=== 升级后的版本 ==="
+              echo "=== 工具链 / libnx 版本 ==="
               dkp-pacman -Q 2>/dev/null | grep -Ei "libnx|switch-dev|switch-curl|devkitA64" || true
               make -k -j$(nproc)
-            ' 2>&1 | tee build.log
+            ' 2>&1 | tee build.log || echo "[warn] make 返回非 0（详见下方错误汇总）"
             # 容器里是 root，产物属主改回 runner，否则上传 artifact 会无权读取
             sudo chown -R "$(id -u):$(id -g)" . || true
           fi
@@ -183,9 +178,9 @@ jobs:
             echo '```'
             grep -n -B1 -A3 'error:' build.log | head -300 || echo '(没有 error: 行)'
             echo '```'
-            echo '### 工具链 / libnx 版本（TLS ABI 是否够新看这个）'
+            echo '### 工具链 / libnx 版本（TLS ABI 是否够新看这个；需 >= 4.10.0）'
             echo '```'
-            grep -Ei 'libnx|switch-dev|switch-curl|devkitA64|升级' build.log | head -40 || true
+            grep -Ei 'libnx|switch-dev|switch-curl|devkitA64' build.log | head -20 || true
             echo '```'
             echo '### make 输出（末尾 120 行）'
             echo '```'
