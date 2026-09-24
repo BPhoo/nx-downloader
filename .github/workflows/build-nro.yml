@@ -65,10 +65,23 @@ jobs:
       - name: 4b. 修补 borealis 与新版 libnx 的不兼容
         run: |
           set -e
-          # 新版 libnx 移除了 swkbdConfigSetStringLenMaxExt，borealis(master) 还在用
-          sed -i 's/swkbdConfigSetStringLenMaxExt(&config, 1);/swkbdConfigSetStringLenMax(\&config, 32);/' \
-            borealis/library/lib/swkbd.cpp
-          grep -n "StringLenMax" borealis/library/lib/swkbd.cpp
+          # 新版 libnx 移除了 swkbdConfigSetStringLenMaxExt。
+          #
+          # ⚠️ 直接把它替换成 swkbdConfigSetStringLenMax(&config, 32) 是**错的**：
+          #    这一行紧跟在 swkbdConfigSetStringLenMax(&config, maxStringLength) 之后，
+          #    会把调用方传进来的 maxStringLength（本程序要 100）覆盖成 32，
+          #    结果界面上最多只能输入 32 个字符 —— 这正是 v2.0.0 里
+          #    「输入框最长 100 字符」失效的原因。
+          #
+          # 正确做法：把这一行**整行删掉**，让上一行的 maxStringLength 生效。
+          sed -i '/swkbdConfigSetStringLenMaxExt/d' borealis/library/lib/swkbd.cpp
+
+          echo '--- 打完补丁后的相关代码 ---'
+          grep -n -B1 -A1 "StringLenMax" borealis/library/lib/swkbd.cpp
+
+          # 断言：Ext 那行确实没了，且 maxStringLength 那行还在
+          ! grep -q "StringLenMaxExt" borealis/library/lib/swkbd.cpp
+          grep -q "swkbdConfigSetStringLenMax(&config, maxStringLength);" borealis/library/lib/swkbd.cpp
 
       - name: 4c. 让左摇杆也能控制上下左右导航
         # borealis(master) 默认只把十字键映射成导航，左摇杆完全不处理

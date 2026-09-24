@@ -12,6 +12,7 @@
 
 #include "app_config.hpp"
 #include "fsx.hpp"
+#include "logx.hpp"
 
 namespace
 {
@@ -194,13 +195,16 @@ size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
         }
     }
 
-    Result rc = fsFileWrite(&ctx->file, ctx->offset, ptr, len, FsWriteOption_None);
-    if (R_FAILED(rc))
+    // 必须走 fsx::writeFileChunk：它内部持锁，避免和 UI 线程的 SD 写入
+    // 撞在同一个 libnx IPC 会话上（那种竞争会表现为卡死/写坏文件）
+    const Result writeRc = fsx::writeFileChunk(&ctx->file, ctx->offset, ptr, len);
+    if (R_FAILED(writeRc))
     {
         char buf[128];
-        std::snprintf(buf, sizeof(buf), "写入 SD 卡失败 (0x%08x)", rc);
+        std::snprintf(buf, sizeof(buf), "写入 SD 卡失败 (%s)", logx::result(writeRc).c_str());
         ctx->writeError = true;
         setError(ctx->prog, buf);
+        logx::linef("写入 SD 卡失败 = %s", logx::result(writeRc).c_str());
         return 0;
     }
 
@@ -278,7 +282,7 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "nx-downloader/1.0 (Nintendo Switch; libnx)");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "nx-downloader/2.1 (Nintendo Switch; libnx)");
     // 刻意不设置 CURLOPT_ACCEPT_ENCODING：
     //   一旦启用自动解压，CURLINFO_CONTENT_LENGTH_DOWNLOAD_T 给出的是「服务器声明的
     //   压缩后长度」，而实际写盘的是解压后的数据，两者对不上会被下面的完整性校验
@@ -537,6 +541,11 @@ void Downloader::run()
 
     const std::string caBundle = findCaBundle();
 
+    logx::linef("网络任务开始(%s): %s", prog->mode == Mode::ToMemory ? "取文本" : "下载文件",
+        prog->url.c_str());
+    logx::linef("目标目录=%s，CA 包=%s", prog->destDir.c_str(),
+        caBundle.empty() ? "(无)" : caBundle.c_str());
+
     CURLcode rc = CURLE_OK;
 
     // 第一次带证书校验；如果设备上没有可用的证书链导致失败，
@@ -556,10 +565,13 @@ void Downloader::run()
 
         rc = curl_easy_perform(curl);
 
+        logx::linef("curl_easy_perform(第%d次, 校验证书=%d) = %d (%s)，落盘 %lld 字节 / 内存 %u 字节",
+            attempt + 1, verify ? 1 : 0, static_cast<int>(rc), curl_easy_strerror(rc),
+            static_cast<long long>(ctx.offset), static_cast<unsigned>(ctx.body.size()));
+
         if (ctx.fileOpen)
         {
-            fsFileFlush(&ctx.file);
-            fsFileClose(&ctx.file);
+            fsx::flushAndCloseFile(&ctx.file);
             ctx.fileOpen = false;
         }
 
@@ -615,6 +627,8 @@ void Downloader::run()
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
     prog->httpStatus.store(httpCode);
 
+    logx::linef("HTTP 响应码 = %ld", httpCode);
+
     curl_easy_cleanup(curl);
 
     // HTTP 层面的错误（404 / 500 之类）也必须当失败处理：
@@ -631,6 +645,8 @@ void Downloader::run()
     {
         prog->percent.store(100);
         prog->state.store(State::Finished);
+
+        logx::linef("网络任务成功：%s", currentOutputPath(prog.get()).c_str());
         return;
     }
 
@@ -648,6 +664,7 @@ void Downloader::run()
     if (prog->cancelRequested.load())
     {
         prog->state.store(State::Cancelled);
+        logx::line("网络任务被取消");
         return;
     }
 
@@ -671,4 +688,6 @@ void Downloader::run()
     }
 
     prog->state.store(State::Failed);
+
+    logx::linef("网络任务失败：curl=%d (%s)", static_cast<int>(rc), curl_easy_strerror(rc));
 }

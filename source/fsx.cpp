@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <unistd.h>
 
 namespace fsx
@@ -14,6 +15,10 @@ namespace
 {
     FsFileSystem g_sd = {};
     bool g_opened    = false;
+
+    // SD 卡 I/O 串行化：libnx 的 FsFileSystem 是 IPC 会话，不能并发使用。
+    // 用 recursive_mutex：公开接口之间会互相调用（如 createAndOpenFile → exists）。
+    std::recursive_mutex g_ioMutex;
 
     // 一次读取的目录项数量，FsDirectoryEntry 较大（约 0x310 字节），别开太大
     constexpr size_t DIR_BATCH = 16;
@@ -148,6 +153,8 @@ bool ensureDirectory(const std::string& sdmcPath)
 
 bool createAndOpenFile(const std::string& sdmcPath, FsFile* out)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened || out == nullptr)
         return false;
 
@@ -172,6 +179,27 @@ bool createAndOpenFile(const std::string& sdmcPath, FsFile* out)
     }
 
     return true;
+}
+
+Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size)
+{
+    if (file == nullptr || data == nullptr || size == 0)
+        return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
+    return fsFileWrite(file, offset, data, size, FsWriteOption_None);
+}
+
+void flushAndCloseFile(FsFile* file)
+{
+    if (file == nullptr)
+        return;
+
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
+    fsFileFlush(file);
+    fsFileClose(file);
 }
 
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names)
@@ -292,6 +320,8 @@ bool accessible(const std::string& devoptabPath)
 
 bool readWholeFile(const std::string& sdmcPath, std::string* out)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened || out == nullptr)
         return false;
 
@@ -330,6 +360,8 @@ bool readWholeFile(const std::string& sdmcPath, std::string* out)
 
 bool writeWholeFile(const std::string& sdmcPath, const std::string& data)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 

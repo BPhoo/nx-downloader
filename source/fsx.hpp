@@ -40,6 +40,22 @@ bool ensureDirectory(const std::string& sdmcPath);
 /// 创建并打开文件用于写入
 bool createAndOpenFile(const std::string& sdmcPath, FsFile* out);
 
+//----------------------------------------------------------------------
+// ⚠️ 为什么写入要单独走这两个接口：
+//   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的** ——
+//   下载工作线程在不停地 fsFileWrite，而 UI 线程可能同时在写 settings.txt /
+//   log.txt。两个线程往同一个会话上发请求会导致响应错配
+//   （表现就是卡死、或者写出错乱的文件）。
+//   所以所有 SD 卡 I/O 都必须经过 fsx 内部的互斥锁串行化，
+//   不要绕过 fsx 直接调 fsFileWrite。
+//----------------------------------------------------------------------
+
+/// 在已打开的文件上写一段数据（内部串行化）。返回 libnx Result，0 = 成功。
+Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size);
+
+/// 冲刷并关闭文件（同样串行化）
+void flushAndCloseFile(FsFile* file);
+
 /// 列出某个目录下的子目录名（不含文件），按名称排序
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names);
 

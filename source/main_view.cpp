@@ -11,6 +11,8 @@
 
 #include "file_picker.hpp"
 #include "fsx.hpp"
+#include "logx.hpp"
+#include "netx.hpp"
 #include "path_picker.hpp"
 #include "progress_dialog.hpp"
 
@@ -24,6 +26,12 @@ namespace
 
 /// 输入框最长 100 字符（需求规定的上限，没有下限）
 constexpr int MAX_URL_LENGTH = 100;
+
+/// 输入框里最多画多少个字符（超出只画省略号；真正的溢出由 scissor 裁掉）
+constexpr size_t MAX_DISPLAY_CHARS = 110;
+
+/// 输入框的宽度下限，保证极端布局下也不会出现 0 宽控件
+constexpr unsigned MIN_INPUT_WIDTH = 200;
 
 /// 检查更新时最多在结果页里显示多少字节（防止超大响应把界面撑爆）
 constexpr size_t MAX_RESULT_DISPLAY = 4000;
@@ -55,36 +63,37 @@ std::string stripLineBreaks(const std::string& s)
     return out;
 }
 
-/// 按显示宽度裁剪字符串（超出补省略号）。按 UTF-8 码点回退，不会切坏汉字。
-std::string fitText(NVGcontext* vg, const std::string& text, float maxWidth)
+/// 按「字符数」粗略截断（UTF-8 安全）。
+///
+/// 为什么不用 nanovg 的 nvgTextBounds 精确测量：
+///   v2.0.0 是在 draw() 里每帧调用 nvgTextBounds 做二分截断的。
+///   那会在绘制过程中反复触发 fontstash 的字形查找/图集刷新，
+///   在 Applet 模式下是不必要的风险。这里改成在 setText() 时按字符数
+///   预先截断好，draw() 只做一次 nvgText，零测量、零分配。
+std::string truncateChars(const std::string& text, size_t maxChars)
 {
-    if (text.empty() || maxWidth <= 0.0f)
+    if (text.empty() || maxChars == 0)
         return "";
 
-    float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    nvgTextBounds(vg, 0.0f, 0.0f, text.c_str(), nullptr, bounds);
-    if (bounds[2] - bounds[0] <= maxWidth)
-        return text;
+    size_t chars = 0;
+    size_t index = 0;
 
-    std::string out = text;
-
-    while (!out.empty())
+    while (index < text.size())
     {
-        size_t cut = out.size() - 1;
+        // 前进一个完整的 UTF-8 码点
+        index++;
+        while (index < text.size() && (static_cast<unsigned char>(text[index]) & 0xC0) == 0x80)
+            index++;
 
-        // 不要切在 UTF-8 的续字节上
-        while (cut > 0 && (static_cast<unsigned char>(out[cut]) & 0xC0) == 0x80)
-            cut--;
-
-        out.resize(cut);
-
-        const std::string trial = out + "…";
-        nvgTextBounds(vg, 0.0f, 0.0f, trial.c_str(), nullptr, bounds);
-        if (bounds[2] - bounds[0] <= maxWidth)
-            return trial;
+        chars++;
+        if (chars >= maxChars)
+            break;
     }
 
-    return "";
+    if (index >= text.size())
+        return text;
+
+    return text.substr(0, index) + "…";
 }
 
 /// 按字节上限裁剪（同样不切坏 UTF-8）
@@ -131,6 +140,19 @@ class UrlInputItem : public ListItem
 
     bool onClick() override
     {
+        //--------------------------------------------------------------
+        // ⚠️ Applet 模式（从相册启动）下**不要**调系统键盘。
+        //    libnx 的 swkbd 本质是「再起一个 applet」，在 applet 环境里
+        //    既可能直接失败，也可能把界面卡住（真机实测过「按 A 就死机」）。
+        //    真要用键盘，必须按住 R 键从游戏图标启动（完整内存模式）。
+        //--------------------------------------------------------------
+        if (appletGetAppletType() != AppletType_Application)
+        {
+            Application::notify("Applet 模式下不能用系统键盘（有死机风险）：请按 X 读取 url.txt，"
+                                "或按住 R 键从游戏图标启动以获得完整功能");
+            return true;
+        }
+
         const std::string initial = this->url;
 
         const bool ok = Swkbd::openForText(
@@ -141,7 +163,7 @@ class UrlInputItem : public ListItem
             initial);
 
         if (!ok)
-            Application::notify("系统键盘没能打开：Applet 模式下请按 X 或点文件图标从 url.txt 读取");
+            Application::notify("系统键盘没能打开：可按 X 或点文件图标从 url.txt 读取");
 
         return true;
     }
@@ -149,6 +171,10 @@ class UrlInputItem : public ListItem
     void setText(const std::string& value)
     {
         this->url = stripLineBreaks(value);
+
+        // 显示用文本在这里一次算好，draw() 里不再做任何测量/分配
+        this->display = truncateChars(this->url, MAX_DISPLAY_CHARS);
+
         this->invalidate();
 
         if (this->onChange)
@@ -171,12 +197,18 @@ class UrlInputItem : public ListItem
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, ctx->theme->textColor);
 
-        unsigned labelWidth = 0;
+        unsigned labelWidth = this->cachedLabelWidth;
         if (!this->label.empty())
         {
-            float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-            nvgTextBounds(vg, 0.0f, 0.0f, this->label.c_str(), nullptr, bounds);
-            labelWidth = static_cast<unsigned>(bounds[2] - bounds[0]);
+            // 标题宽度只测一次（两个输入框就是两次 nvgTextBounds，之后一直复用）。
+            // v2.0.0 是每帧都测，还会为截断反复测 —— 那属于没必要的风险。
+            if (labelWidth == 0)
+            {
+                float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                nvgTextBounds(vg, 0.0f, 0.0f, this->label.c_str(), nullptr, bounds);
+                labelWidth         = static_cast<unsigned>(bounds[2] - bounds[0]) + 2;
+                this->cachedLabelWidth = labelWidth;
+            }
 
             nvgBeginPath(vg);
             nvgText(vg, static_cast<float>(x + padding), static_cast<float>(midY), this->label.c_str(), nullptr);
@@ -199,28 +231,41 @@ class UrlInputItem : public ListItem
             static_cast<float>(boxWidth), static_cast<float>(boxHeight), radius);
         nvgFill(vg);
 
-        // 内容
+        //------------------------- 内容 -------------------------
         const unsigned textLeft = boxHeight / 4;
-        const float maxTextW    = static_cast<float>(boxWidth) - textLeft * 2.0f;
 
         const bool empty        = this->url.empty();
-        const std::string& body = empty ? this->placeholder : this->url;
+        const std::string& body = empty ? this->placeholder : this->display;
 
         nvgFontSize(vg, style->List.Item.valueSize);
         nvgFontFaceId(vg, ctx->fontStash->regular);
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, empty ? ctx->theme->descriptionColor : ctx->theme->listItemValueColor);
 
-        const std::string shown = fitText(vg, body, maxTextW);
+        // 用 scissor 把文本裁在输入框内：不需要任何文字测量，
+        // 超长链接也只会被干净地切掉，不会溢出到图标/按钮上。
+        nvgSave(vg);
+        nvgScissor(vg,
+            static_cast<float>(boxLeft + textLeft),
+            static_cast<float>(boxTop),
+            static_cast<float>(boxWidth - textLeft * 2),
+            static_cast<float>(boxHeight));
 
         nvgBeginPath(vg);
-        nvgText(vg, static_cast<float>(boxLeft + textLeft), static_cast<float>(boxTop + static_cast<int>(boxHeight / 2)),
-            shown.c_str(), nullptr);
+        nvgText(vg, static_cast<float>(boxLeft + textLeft),
+            static_cast<float>(boxTop + static_cast<int>(boxHeight / 2)),
+            body.c_str(), nullptr);
+
+        nvgRestore(vg);
     }
 
   private:
     std::string url;
     std::string placeholder;
+    /// 已按字符数截断的显示文本（draw 直接用）
+    std::string display;
+    /// 标题宽度缓存（首次绘制时测一次）
+    unsigned cachedLabelWidth = 0;
 };
 
 //=====================================================================
@@ -237,7 +282,8 @@ class InputRow : public BoxLayout
         const unsigned h = listItemHeight();
 
         this->setHeight(h);
-        this->setSpacing(h / 6);
+        // 行高 / 6 ≈ 11，兜底不小于 8，别出现 0 间距
+        this->setSpacing(h / 6 > 8 ? h / 6 : 8);
 
         // 顺序就是左右顺序。输入框排最前，宽度在 layout() 里根据剩余空间算。
         this->input = new UrlInputItem(labelText, placeholder);
@@ -261,8 +307,16 @@ class InputRow : public BoxLayout
 
     void layout(NVGcontext* vg, Style* style, FontStash* stash) override
     {
-        const unsigned h   = this->getHeight();
-        const unsigned gap = this->getSpacing();
+        // 用 getHeight(false) 拿「原始高度」，不要用 getHeight()：
+        // 后者会乘上 collapseState（滚动出屏时会动画到 0），
+        // 高度为 0 时子视图宽度会被算成 0，白白多出一堆边界情况。
+        unsigned h = this->getHeight(false);
+
+        // 兜底：万一高度还没被父级设好（或异常为 0），退回样式表里的行高
+        if (h < 20)
+            h = listItemHeight();
+
+        const unsigned gap = static_cast<unsigned>(this->getSpacing());
 
         // 图标按钮做成正方形，访问按钮稍宽（按行高成比例，跟着系统 UI 缩放走）
         const unsigned iconWidth = h;
@@ -273,8 +327,8 @@ class InputRow : public BoxLayout
         if (this->folderButton != nullptr)
             fixed += iconWidth;
 
-        const unsigned total = this->getWidth();
-        const unsigned inputWidth = (total > fixed + 200) ? (total - fixed) : 200;
+        const unsigned total      = this->getWidth();
+        const unsigned inputWidth = (total > fixed + MIN_INPUT_WIDTH) ? (total - fixed) : MIN_INPUT_WIDTH;
 
         // BoxLayout 的水平布局用的是各子视图「已存」的宽度，
         // 所以必须在调基类之前把宽度都定下来。
@@ -403,10 +457,16 @@ MainView::MainView(Downloader* downloader)
     Label* tip = new Label(LabelStyle::DESCRIPTION,
         "A 输入链接（最长 100 字符）· X 直接读取 " + std::string(appcfg::URL_FILE) +
             " 里对应的值 · 文件图标可挑选任意 .txt\n"
-            "Applet 模式（从相册启动）下系统键盘可能打不开，此时请用 X 或文件图标读取；"
-            "也可按住 R 键从游戏图标启动以获得完整内存模式。",
+            "Applet 模式（从相册启动）下系统键盘会被禁用（有死机风险），此时请用 X 或文件图标读取；"
+            "需要键盘请按住 R 键从游戏图标启动。",
         true);
     this->addView(tip);
+
+    // 运行环境诊断行：出问题时这一行就能看出是哪一环不对，
+    // 细节（含 libnx 的 Result 错误码）在 log.txt 里。
+    Label* diag = new Label(LabelStyle::DESCRIPTION,
+        "环境：" + netx::describe() + "\n运行日志：" + std::string(appcfg::LOG_FILE), true);
+    this->addView(diag);
 
     // 控件都建好之后再回填上次保存的内容
     if (!this->savedUpdate.empty())
@@ -626,6 +686,21 @@ void MainView::startUpdateCheck()
         return;
     }
 
+    if (!netx::ready() && !netx::init())
+    {
+        this->showMessage("网络不可用",
+            "socket 初始化失败 " + logx::result(netx::socketError()) + "（小配置重试 " +
+                logx::result(netx::retryError()) + "）。\n\n"
+                "可以试试：\n"
+                "1) 确认主机已连上 Wi-Fi；\n"
+                "2) 按住 R 键从游戏图标启动本程序（完整内存模式）；\n"
+                "3) 重启主机后再试（上次异常退出可能还占着 bsd 服务）。\n\n"
+                "详细日志：\n" + std::string(appcfg::LOG_FILE));
+        return;
+    }
+
+    logx::linef("开始检查更新: %s", url.c_str());
+
     this->updateRow->input->setText(url);
     this->saveSettings();
 
@@ -663,6 +738,21 @@ void MainView::startDownload()
         this->showMessage("正在忙", "请等当前任务结束，或先在上一个对话框里点「取消」。");
         return;
     }
+
+    if (!netx::ready() && !netx::init())
+    {
+        this->showMessage("网络不可用",
+            "socket 初始化失败 " + logx::result(netx::socketError()) + "（小配置重试 " +
+                logx::result(netx::retryError()) + "）。\n\n"
+                "可以试试：\n"
+                "1) 确认主机已连上 Wi-Fi；\n"
+                "2) 按住 R 键从游戏图标启动本程序（完整内存模式）；\n"
+                "3) 重启主机后再试（上次异常退出可能还占着 bsd 服务）。\n\n"
+                "详细日志：\n" + std::string(appcfg::LOG_FILE));
+        return;
+    }
+
+    logx::linef("开始下载: %s", url.c_str());
 
     this->downloadRow->input->setText(url);
     this->saveSettings();
@@ -741,6 +831,11 @@ void MainView::onTaskFinished()
         {
             const std::string body = capText(this->downloader->bodyText(), MAX_RESULT_DISPLAY);
 
+            logx::linef("检查更新完成：HTTP %ld，返回 %u 字节（tlsVerified=%d）",
+                this->downloader->httpStatus(),
+                static_cast<unsigned>(this->downloader->bodyText().size()),
+                this->downloader->tlsVerified() ? 1 : 0);
+
             Application::notify("检查完成（HTTP " + std::to_string(this->downloader->httpStatus()) + "）");
 
             ResultView* result = new ResultView(this->downloader->finalUrl(), body);
@@ -770,6 +865,8 @@ void MainView::onTaskFinished()
 
         if (text.empty())
             text = "未知错误。";
+
+        logx::linef("检查更新失败(%d): %s", static_cast<int>(state), text.c_str());
 
         if (dialog != nullptr)
             dialog->close([this, title, text] { this->showMessage(title, text); });
@@ -816,6 +913,9 @@ void MainView::onTaskFinished()
             break;
         }
     }
+
+    logx::linef("下载结束(%d)：%s", static_cast<int>(state),
+        state == Downloader::State::Finished ? this->downloader->outputPath().c_str() : text.c_str());
 
     if (dialog != nullptr)
         dialog->close([this, title, text] { this->showMessage(title, text); });
