@@ -2,15 +2,20 @@
     NX Downloader - 网络初始化
 
     做法参考 NXSimpleDownloader（Mayo0x0）与 hb-appstore：
-      1. 先 nifmInitialize(NifmServiceType_User) —— 把网络接口服务起起来；
+      1. 先 nifmInitialize(NifmServiceType_User) 把网络接口服务起起来；
       2. 再 socketInitializeDefault()；
-      3. 失败时用一份**真正更小**的配置重试（hbmenu/Applet 模式下内存紧张时有用）；
+      3. 若真的失败，用一份**显著更小**的配置重试；
       4. 退出顺序 socketExit() → nifmExit()。
 
-    ⚠️ 上一版 v2.0.0 的“重试”是错的：它照抄了一份和 libnx 默认配置**一模一样**的
-    SocketInitConfig（libnx 的 socketInitializeDefault() 内部就是 socketInitialize(NULL)
-    → &g_defaultSocketInitConfig），所以重试必然同样失败，等于没有兜底。
-    这里把缓冲区和会话数都压到很小，才是真正意义上的降级。
+    ⚠️ v2.1.0 及之前有两个错，都会让「网络不可用」：
+      a) 降级重试照抄了 libnx 的默认配置（socketInitializeDefault() 内部就是
+         socketInitialize(NULL) → &g_defaultSocketInitConfig），等于没有兜底；
+      b) ★ 把 `LibnxError_AlreadyInitialized` 当成了失败。
+         真机日志给出 0x00000F59 = MAKERESULT(Module_Libnx=345, 7)
+         = LibnxError_AlreadyInitialized。而 libnx 的 socket.c 里
+         `AddDevice("soc:")` **只在 bsdInitialize 成功之后才执行**，
+         所以收到这个错误码恰恰说明「本进程里 socket 已经初始化好并且可用」。
+         把它当失败就等于自己把联网功能整个禁掉 —— 已改为按成功处理。
 */
 #pragma once
 
@@ -38,6 +43,9 @@ Result retryError();
 
 /// nifmInitialize 的错误码
 Result nifmError();
+
+/// socket 层自检（开一个 TCP socket）的错误码，0 表示自检通过
+Result probeError();
 
 /// 是否运行在「完整内存模式」（按住 R 从游戏图标启动）
 bool fullMemoryMode();

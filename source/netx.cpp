@@ -11,12 +11,20 @@ namespace netx
 namespace
 {
 
-bool g_socketOk = false;
-bool g_nifmOk   = false;
+/// libnx 的 LibnxError_AlreadyInitialized
+///   Module_Libnx = 345, LibnxError_AlreadyInitialized = 7
+///   → MAKERESULT = 0x00000F59（真机日志里就是这个值）
+constexpr Result kAlreadyInitialized = MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
+
+bool g_socketOk    = false;
+/// socket 是不是「我们自己」初始化的（决定退出时要不要 socketExit）
+bool g_socketOwner = false;
+bool g_nifmOk      = false;
 
 Result g_nifmErr   = 0;
 Result g_socketErr = 0;
 Result g_retryErr  = 0;
+Result g_probeErr  = 0;
 
 std::string g_connText = "未查询";
 
@@ -49,6 +57,26 @@ void probeConnection()
         g_connText = std::string("未联网（") + typeText + "，状态码 " + std::to_string(static_cast<int>(status)) + "）";
 }
 
+/// socket 层可用性自检：开一个 TCP socket 再关掉。
+/// 只用来写日志、帮助判断，**不作为禁用联网的依据**（那种「凭一个返回码就把功能关掉」
+/// 的思路正是 v2.1.0 的错）。
+void probeSocketLayer()
+{
+    // AF_INET = 2, SOCK_STREAM = 1（Switch/newlib 的固定取值）
+    const int fd = bsdSocket(2, 1, 0);
+
+    if (fd < 0)
+    {
+        g_probeErr = socketGetLastResult();
+        logx::linef("socket 层自检：创建 TCP socket 失败（%s）", logx::result(g_probeErr).c_str());
+        return;
+    }
+
+    bsdClose(fd);
+    g_probeErr = 0;
+    logx::line("socket 层自检：能创建 TCP socket，网络层可用");
+}
+
 } // namespace
 
 Result socketError()
@@ -66,6 +94,11 @@ Result nifmError()
     return g_nifmErr;
 }
 
+Result probeError()
+{
+    return g_probeErr;
+}
+
 bool ready()
 {
     return g_socketOk;
@@ -80,7 +113,7 @@ std::string describe()
 {
     std::string text = std::string("模式=") + (fullMemoryMode() ? "完整内存" : "Applet（相册启动）");
     text += "，联网=" + g_connText;
-    text += "，socket=" + (g_socketOk ? std::string("正常") : logx::result(g_socketErr));
+    text += "，network=" + (g_socketOk ? std::string("可用") : ("不可用 " + logx::result(g_socketErr)));
     return text;
 }
 
@@ -109,21 +142,42 @@ bool init()
     // 2. socket —— 先用 libnx 默认配置
     //------------------------------------------------------------------
     g_socketErr = socketInitializeDefault();
+
     if (R_SUCCEEDED(g_socketErr))
     {
-        g_socketOk = true;
+        g_socketOk    = true;
+        g_socketOwner = true;
         logx::line("socketInitializeDefault() = OK");
+        probeSocketLayer();
         return true;
     }
 
-    logx::linef("socketInitializeDefault() 失败 = %s", logx::result(g_socketErr).c_str());
+    logx::linef("socketInitializeDefault() = %s", logx::result(g_socketErr).c_str());
 
     //------------------------------------------------------------------
-    // 3. 降级重试 —— 这一次是**真的更小**的配置
+    // 3. ★ 已经被初始化过 —— 这不是失败，是「现成的可用状态」
+    //
+    //    libnx 的 socket.c 里 `AddDevice(&g_socketDevoptab)`（登记 "soc:"）只在
+    //    bsdInitialize 成功之后执行；socketInitialize 开头只做了一件事：
+    //        int dev = FindDevice("soc:");
+    //        if (dev != -1) return MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
+    //    所以拿到 AlreadyInitialized ⇒ 本进程里已经有一次成功的 socket 初始化。
+    //------------------------------------------------------------------
+    if (g_socketErr == kAlreadyInitialized)
+    {
+        g_socketOk    = true;
+        g_socketOwner = false; // 不是我们开的，退出时不要 socketExit
+
+        logx::line("socket 已被初始化过（AlreadyInitialized）—— 说明网络层本来就可用，按成功处理");
+        probeSocketLayer();
+        return true;
+    }
+
+    //------------------------------------------------------------------
+    // 4. 其它错误 —— 降级重试，这次是**真的更小**的配置
     //    默认配置（libnx g_defaultSocketInitConfig）：
     //      tcp 0x8000 / 0x10000 / 0x40000 / 0x40000
     //      udp 0x2400 / 0xA500, sb_efficiency = 4, num_bsd_sessions = 3
-    //    下面把每一项都压到很小，并只开 1 个 bsd 会话。
     //------------------------------------------------------------------
     SocketInitConfig small{};
     small.tcp_tx_buf_size     = 0x800;
@@ -140,23 +194,29 @@ bool init()
 
     if (R_SUCCEEDED(g_retryErr))
     {
-        g_socketOk = true;
+        g_socketOk    = true;
+        g_socketOwner = true;
         logx::line("socketInitialize(小配置) = OK");
+        probeSocketLayer();
         return true;
     }
 
-    logx::linef("socketInitialize(小配置) 失败 = %s", logx::result(g_retryErr).c_str());
+    logx::linef("socketInitialize(小配置) = %s", logx::result(g_retryErr).c_str());
     logx::line("网络不可用：联网功能将被禁用，其余功能仍可使用");
     return false;
 }
 
 void exit()
 {
-    if (g_socketOk)
+    // 只关我们自己开的：如果是别人（启动阶段）已经初始化好的，就不要拆掉
+    if (g_socketOk && g_socketOwner)
     {
         socketExit();
-        g_socketOk = false;
+        logx::line("socketExit() 完成");
     }
+
+    g_socketOk    = false;
+    g_socketOwner = false;
 
     if (g_nifmOk)
     {
