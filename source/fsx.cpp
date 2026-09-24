@@ -227,7 +227,11 @@ bool listDirectory(const std::string& sdmcPath, std::vector<std::string>* dirs, 
         files->clear();
 
     FsDir dir = {};
-    Result rc = fsFsOpenDirectory(&g_sd, toFsPath(sdmcPath).c_str(), FsDirOpenMode_ReadAll, &dir);
+    // FsDirOpenMode 是位掩码：ReadDirs = BIT(0)、ReadFiles = BIT(1)。
+    // 注意新版 libnx 里**没有** FsDirOpenMode_ReadAll 这个枚举值，
+    // 想要「目录 + 文件都要」必须按位或，否则编译不过。
+    const u32 mode = FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles;
+    Result rc = fsFsOpenDirectory(&g_sd, toFsPath(sdmcPath).c_str(), mode, &dir);
     if (R_FAILED(rc))
         return false;
 

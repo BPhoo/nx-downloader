@@ -134,26 +134,29 @@ jobs:
           fi
 
       - name: 6. 编译
+        # 用 make -k（keep going）：即使某个 .cpp 编译失败也继续编译其余文件，
+        # 这样一次 CI 就能把所有编译错误都暴露出来，不用一个个来回试。
+        # 完整日志写进 build.log，并在 Step Summary 里单独摘出所有 error: 行。
         run: |
           set -o pipefail
           if [ "${{ steps.dkp.outputs.mode }}" = "native" ]; then
             export DEVKITPRO=/opt/devkitpro
             export PATH="/opt/devkitpro/tools/bin:$PATH"
-            make -j$(nproc) 2>&1 | tail -200 | tee build.log
+            make -k -j$(nproc) 2>&1 | tee build.log
           else
             docker run --rm -v "$PWD":/src -w /src devkitpro/devkita64:latest \
-              bash -lc 'make -j$(nproc)' 2>&1 | tail -200 | tee build.log
+              bash -lc 'make -k -j$(nproc)' 2>&1 | tee build.log
             # 容器里是 root，产物属主改回 runner，否则上传 artifact 会无权读取
             sudo chown -R "$(id -u):$(id -g)" . || true
           fi
           {
-            echo '### make 输出（末尾 200 行）'
+            echo '### 编译错误汇总（error: ...）'
             echo '```'
-            cat build.log
+            grep -n -B1 -A3 'error:' build.log | head -300 || echo '(没有 error: 行)'
             echo '```'
-            echo '### 工作区根目录'
+            echo '### make 输出（末尾 120 行）'
             echo '```'
-            ls -la
+            tail -120 build.log
             echo '```'
             echo '### 产物搜索'
             echo '```'
