@@ -12,6 +12,7 @@ const char* URL_FILE        = "sdmc:/switch/nx-downloader/url.txt";
 const char* SETTINGS_FILE   = "sdmc:/switch/nx-downloader/settings.txt";
 const char* CA_BUNDLE       = "sdmc:/switch/nx-downloader/cacert.pem";
 const char* LOG_FILE        = "sdmc:/switch/nx-downloader/log.txt";
+const char* RESULT_FILE     = "sdmc:/switch/nx-downloader/update_result.txt";
 const char* DEFAULT_OUT_DIR = "sdmc:/";
 
 namespace

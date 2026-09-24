@@ -1,209 +1,182 @@
-# NX Downloader —— 构建与部署说明
+# NX Downloader（v2.2.0）
 
-Nintendo Switch 自制程序（`.nro`）：上行检查更新、下行下载文件，全部基于
-**devkitPro/libnx + borealis + libcurl** 实现。
+Nintendo Switch 自制程序（`.nro`）：上行检查更新、下行下载文件。
+
+```
+更新链接  [ 输入框 ]  [txt图标]              [ 访问 ]
+下载链接  [ 输入框 ]  [txt图标] [dir图标]    [ 访问 ]
+状态：就绪
+[ 进度条 ]  [ 取消当前任务 ]
+详情 / 返回内容：……
+下载保存到：sdmc:/（第二行的文件夹图标可更换）
+提示 · 环境 · 日志路径
+```
 
 ---
 
-## 1. 功能与界面
+## 1. 这个版本修了什么（v2.2.0）
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│  NX Downloader                                                       │
-│  上行检查更新 · 下行下载文件                                          │
-├──────────────────────────────────────────────────────────────────────┤
-│  更新链接   [ https://example.com/version.txt      ]  [txt]  [ 访问 ] │
-│  下载链接   [ https://example.com/app.nro          ]  [txt] [dir] [访问] │
-├──────────────────────────────────────────────────────────────────────┤
-│  下载保存到：sdmc:/  （点第二行的文件夹图标可更换）                    │
-└──────────────────────────────────────────────────────────────────────┘
-```
+v2.1.1 的真机日志显示：**网络其实已经成功**（`curl_easy_perform = 0`、HTTP 200、取回 1014 字节），
+日志停在「网络任务成功：」之后就没了 —— 说明**卡死在 UI 侧收尾的那几行代码里**，和 curl / 网络无关。
+顺着这个线索把收尾路径整段重写，同时修掉几处真实缺陷：
 
-| 控件 | 说明 |
-| --- | --- |
-| 第一行 输入框 | 检查更新用的链接。按 **A** 打开系统键盘手动输入（**最长 100 字符，无下限**） |
-| 第一行 [txt] | 打开 txt 选择器，选中文件后自动填入该文件里的 `updata` |
-| 第一行 [访问] | 访问该链接，把**服务器返回内容**显示在结果页（可滚动，B 返回） |
-| 第二行 输入框 | 下载用的链接，输入方式同上 |
-| 第二行 [txt] | 打开 txt 选择器，选中后自动填入该文件里的 `download` |
-| 第二行 [dir] | 选择下载保存目录（默认 **SD 卡根目录 `sdmc:/`**） |
-| 第二行 [访问] | 访问该链接并下载文件，带进度条 / 完成提示 / 错误提示 |
+| # | 问题 | 说明与修法 |
+| --- | --- | --- |
+| 1 | **收尾路径是「在动画回调里改视图栈」** | v2.1.x 的写法是 `RepeatingTask → Dialog::close(cb) → menu_animation 回调 → Application::pushView(结果页)`。borealis 的 `View::show/hide` 每次都 `menu_animation_kill_by_tag()`，而 `Dialog::close(cb)` 本身就是「动画播完再回调」，两者嵌套（push/pop + kill 同一个 tag）非常脆。<br>**v2.2.0 把这条路径整个删掉**：不再用 Dialog、不再用通知，任务收尾只改 Label 文本，**绝不改动视图栈**。唯一保留 `pushView` 的地方是「点图标打开文件/目录选择器」这类按键触发的常规路径。 |
+| 2 | **工作线程「先置终态、后写日志」** | 原顺序是先 `state.store(Finished)` 再 `logx::linef(...)`，UI 可能在 worker 还在写盘时就开始处理结果。<br>现在**终态一律最后一步置位**：UI 一旦看到终态，就说明该做的都做完了（含日志落盘）。 |
+| 3 | **部分 SD 卡访问没有走锁** | `removeFile`（失败清理时由工作线程调用）与 `getFreeSpace`（下载写入回调里调用）当时是裸调用。libnx 的 `FsFileSystem` 是 IPC 会话、**不是并发安全的**，与会写日志/设置的 UI 线程并发使用会导致响应错配。<br>现在 `fsx` 里所有公开接口统一过同一把 `recursive_mutex`。 |
+| 4 | **轮询任务退化成每帧都跑** | 自定义的 `RepeatingTask::run()` 没有调用基类实现，而基类那句 `lastRun = currentTime` 是唯一的节流依据 → `lastRun` 恒为 0，任务变成 60 次/秒而不是每 100ms。<br>现在显式调用 `RepeatingTask::run(currentTime)`。 |
+| 5 | **日志满 24KB 后静默停止** | 出问题时最有价值的是最后几行，静默停止反而让诊断失效。现在改成**丢掉前半段、保留最近的**。 |
+| 6 | **诊断不够细** | 新增 UI 侧面包屑日志（`[UI]` 前缀）：`任务收尾开始 → 读到返回内容 N 字节 → 状态行已更新 → 详情区已更新 → 收尾完成`，以及任务进行期间每秒一行的「轮询心跳」。**万一还卡，日志的最后一行就是卡住的那个调用。** |
 
-### 按键
+另外：检查更新的返回内容会**完整存到 `update_result.txt`**（页面只显示前 2000 字节），
+即使界面出问题，内容也不会丢。
 
-| 按键 | 作用 |
-| --- | --- |
-| `A` | 打开系统键盘输入链接；在列表里则是「进入 / 选择」 |
-| `X` | **快捷读取** `sdmc:/switch/nx-downloader/url.txt` 里对应的值（第一行读 `updata`，第二行读 `download`） |
-| `十字键` / **左摇杆** | 移动焦点（左右在同一行内切换，上下在行之间切换） |
-| `B` | 返回上一屏 |
-| `+` | 退出程序 |
-
-### 下载反馈
-* **进度**：模态对话框里显示百分比 + `已下载 / 总大小`
-* **完成提示**：通知横幅 + 弹窗显示最终文件路径
-* **错误提示**：弹窗显示具体原因（HTTP 4xx/5xx、证书、空间不足、写盘失败等）
-* **取消**：对话框上的「取消」按钮；取消/失败会**删掉半成品文件**，不留损坏文件
+> 诚实说明：本轮**没有**找到能 100% 复现「冻死」的单点，但收尾路径上唯一不寻常的写法（在动画回调里改视图栈）
+> 已经整段移除，同时补上了能精确定位的日志。如果仍复现，请把 `log.txt` 发回：最后一行的 `[UI]` 面包屑会直接指出卡在哪个调用。
 
 ---
 
-## 2. 项目结构
+## 2. 目录结构
 
 ```
 nx-downloader/
-├── Makefile                     devkitPro/libnx 标准模板 + borealis + curl-config
-├── icon.jpg                     256×256 JPEG，.nro 的图标
-├── .github/workflows/build-nro.yml   GitHub Actions 云编译
-├── romfs/                       会被打进 .nro，运行时通过 romfs:/ 访问
-│   ├── i18n/en-US/brls.json     底部按键提示等文案
-│   ├── icon/folder.png          「选保存目录」按钮的图标（128×128）
-│   ├── icon/txt.png             「选 txt 文件」按钮的图标（128×128）
-│   └── material/                Material 图标字体
+├── Makefile                      devkitPro/libnx 标准模板（已接好 borealis 与 switch-curl）
+├── icon.jpg                      主图标
+├── BUILD.md                      本文件
+├── BUILD-v2.1.1.md               上一版说明（存档）
+├── .github/workflows/build-nro.yml    在 GitHub 服务器云编译，产出 nx-downloader.nro
+├── romfs/
+│   ├── i18n/en-US/brls.json      borealis 文案（底部按键提示等）
+│   ├── icon/txt.png              「选 txt」图标（128×128）
+│   ├── icon/folder.png           「选保存目录」图标（128×128）
+│   └── material/MaterialIcons-Regular.ttf
 └── source/
-    ├── main.cpp                 初始化顺序 / 中文字体 fallback / 主循环
-    ├── app_config.hpp/.cpp      项目文件夹 + url.txt 的创建与宽松解析
-    ├── downloader.hpp/.cpp      libcurl 工作线程：落盘下载 + 文本拉取（两种模式）
-    ├── fsx.hpp/.cpp             libnx FsFileSystem 封装（读写、列目录、路径工具）
-    ├── main_view.hpp/.cpp       主界面（双行结构、自绘输入框、结果页）
-    ├── file_picker.hpp/.cpp     选择 .txt 文件的浏览视图
-    ├── path_picker.hpp/.cpp     选择保存目录的浏览视图
-    └── progress_dialog.hpp/.cpp 进度对话框
+    ├── main.cpp                  启动顺序：romfs → SD 卡 → 网络 → curl → 项目文件夹 → UI
+    ├── app_config.{hpp,cpp}      项目文件夹 / url.txt 的生成与宽松解析
+    ├── fsx.{hpp,cpp}             libnx FsFileSystem 封装（**所有公开接口统一串行化**）
+    ├── logx.{hpp,cpp}            SD 卡日志（多线程安全、带 [UI] 标记、满了保留最近部分）
+    ├── netx.{hpp,cpp}            nifm + socket 初始化（AlreadyInitialized 按成功处理）
+    ├── downloader.{hpp,cpp}      libcurl 下载/取文本；pthread 2MiB 栈；终态最后置位
+    ├── main_view.{hpp,cpp}       主界面（本版本重写的核心）
+    ├── file_picker.{hpp,cpp}     选任意 .txt
+    └── path_picker.{hpp,cpp}     选保存目录
 ```
+
+> `source/progress_dialog.*` 在 v2.2.0 已废弃（进度改为页内显示）。
+> 仓库里可能还留着这两个文件，因为当前的上传通道（GitHub 网页 `/upload`）只能新增/覆盖、不能删除文件；
+> 流水线里有一步 `rm -f source/progress_dialog.{cpp,hpp}` 保证它们不参与编译。
 
 ---
 
 ## 3. SD 卡上的文件
 
-程序启动时如果发现**项目文件夹不存在就创建**，并在里面生成 `url.txt` 模板：
-
 ```
 sdmc:/switch/nx-downloader/
-├── nx-downloader.nro      程序本体
-├── url.txt                ← 启动时自动生成（格式见下）
-├── settings.txt           界面里改过的链接与保存目录（自动写回）
-├── log.txt                ← 每次启动重建的运行日志，排错看这个
-└── cacert.pem             可选：放了它就严格校验 HTTPS 证书
+├── nx-downloader.nro              程序本体
+├── url.txt                        首次启动自动生成，格式见下
+├── settings.txt                   界面里改过的链接与保存目录（自动写回）
+├── log.txt                        运行日志（每次启动重建；真机排错就看它）
+├── update_result.txt              上次检查更新拿到的完整返回内容
+└── cacert.pem                     可选：放了它就严格校验 HTTPS 证书
 ```
 
-`url.txt` 的内容：
+`url.txt` 格式（解析很宽松：`updata`/`update` 都认、`:` 与 `=` 都认、可加引号、支持注释、省略协议会自动补 `https://`）：
 
-```text
-// NX Downloader 配置文件（直接用文本编辑器改就行，改完重启程序生效）
-// 第一项：检查更新用的链接，对应界面第一行的「访问」
-// 第二项：下载文件用的链接，对应界面第二行的「访问」
-// 链接可以省略 https:// ，程序会自动补上
-{
-    updata:   https://example.com/version.txt ,
-    download: https://example.com/app.nro
-}
+```
+{ updata: https://example.com/version.txt , download: https://example.com/app.zip }
 ```
 
-解析做得很宽松，下面这些写法都认：
-
-* 键名大小写不敏感；`updata` 与 `update` 等价
-* 分隔符 `:` 或 `=` 都行，也可以不写
-* 值可以加单/双引号
-* `//`、`#`、`;` 开头的整行按注释忽略
-* 值里省略协议时自动补 `https://`（所以写 `example.com/a.nro` 也可以）
-* 换行、逗号分隔都行；`{` `}` 只是装饰，可以不加
+- 第一行「访问」用 `updata`（检查更新，显示返回内容）
+- 第二行「访问」用 `download`（下载文件）
+- 按 **X** 键：焦点在哪一行，就读该行对应的值
 
 ---
 
-## 4. 本地构建（需要 devkitPro）
+## 4. 安装与操作
 
-> ⚠️ 先做网络检查：`pkg.devkitpro.org` 挂在 Cloudflare 后面，部分地区会被**整站 403**，
-> 表现是 `dkp-pacman` 死活装不上包。若被拦，请直接看第 5 节走云编译。
+1. 把 `nx-downloader.nro` 放到 `SD:/switch/nx-downloader/`。
+2. 从**游戏图标**启动（按住 <kbd>R</kbd> 打开任意游戏进入 hbmenu）—— 这是完整内存模式。
+   - 从「相册」启动也能用，但属于 Applet 模式：**程序会禁用系统键盘**（真机实测按 A 调键盘有死机风险），
+     此时请用 `X` 或文件图标读 `url.txt`。
+3. 首次启动自动创建项目文件夹与 `url.txt`（模板里是示例链接，用 `X` 读完再改自己的即可）。
+4. 操作：
+   - **A**：打开键盘手动输入链接（最长 100 字符，无下限）
+   - **X**：直接读 `url.txt` 里对应的值
+   - **txt 图标**：打开文件浏览器，选任意 `.txt`，自动取出里面的 `updata` / `download`
+   - **dir 图标**（仅第二行）：选下载保存目录，默认 `sdmc:/`
+   - **十字键 / 左摇杆**：移动焦点；**+**：退出
+
+**同名文件会被直接覆盖**（写入侧是「先删再建」），界面上不再弹确认框 —— 这是本轮去掉弹窗的一部分。
+
+---
+
+## 5. 从源码编译
+
+### 5.1 云端编译（推荐，本机无需装工具链）
+
+推送代码到 GitHub 即触发 `.github/workflows/build-nro.yml`：
+
+- 先尝试用 devkitPro 官方脚本装工具链；若 `apt.devkitpro.org` 被 Cloudflare 拦（部分地区常见），
+  自动退回官方镜像 `devkitpro/devkita64` 编译。
+- 编译用 `make -k`，并把所有 `error:` 行写进 Step Summary —— 一次 CI 就能看到全部编译错误。
+- 产物在 Actions 运行页的 Artifacts 里（`nx-downloader-nro`）。
+  **注意：即使是公开仓库，下载 artifact 也必须登录 GitHub。**
+
+### 5.2 本地编译
 
 ```bash
-# 在 devkitPro 的 MSYS2 Shell 里执行（不是普通 Git Bash）
-dkp-pacman -S --needed switch-dev switch-curl
+# 依赖：devkitPro（switch-dev + switch-curl）
+export DEVKITPRO=/opt/devkitpro
+export PATH=$DEVKITPRO/tools/bin:$PATH
 
-# 工程根目录下
 git clone --depth=1 --recursive -b master https://github.com/XITRIX/borealis.git borealis
-make sync-resources          # 把 borealis 的 i18n / material 资源同步进 romfs/
-make -j$(nproc)
-
-# 产物
-ls -lh nx-downloader.nro
+make sync-resources      # 把 borealis 的 i18n / material 资源同步进 romfs/
+make -j$(nproc)          # 产出 nx-downloader.nro
 ```
 
-拷到 SD 卡：`SD:/switch/nx-downloader/nx-downloader.nro`
+关键点（都踩过坑）：
 
-在 Switch 上从 **hbmenu** 启动，或**按住 R 键从任意游戏图标**启动（完整内存模式，
-Applet 模式下系统键盘可能打不开）。
+- **borealis 必须用 `-b master`**：默认分支是 `moonlight_wiliwili`，结构不同、找不到 `library/borealis.mk`。
+- **链接参数用 `curl-config --libs`**：`LIBS := $(CURL_LIBS) -lnx -lm`，这样 mbedTLS / zlib 等传递依赖不会漏。
+- **必须保留 RTTI 与异常**：不要加 `-fno-rtti` / `-fno-exceptions`（borealis 需要）。
+- **`.DEFAULT_GOAL := all`**：Makefile 里 `sync-resources` 写在 `all` 之前，不写这行 `make` 会 1 秒结束且不出包。
+- **CI 里不要再升级工具链**：镜像自带 libnx 4.12.0（≥4.10.0，满足固件 21.x 的 TLS ABI 要求），
+  升级会把 gcc 从 15 换到 16，平白引入变量。
 
 ---
 
-## 5. 装不了 devkitPro？用 GitHub Actions 云编译
+## 6. 排错
 
-本机零安装：把工程推到 GitHub，让 runner 编译，再从 Actions 页面下载 Artifacts。
-
-`.github/workflows/build-nro.yml` 已经处理好这些坑：
-
-| 坑 | 处理方式 |
+| 现象 | 原因 / 处理 |
 | --- | --- |
-| GitHub runner 访问 `apt.devkitpro.org` 同样被 Cloudflare 拦 | 探活失败时自动退到官方镜像 `devkitpro/devkita64`，编译在容器里跑 |
-| `XITRIX/borealis` 默认分支是 `moonlight_wiliwili`（结构不同） | 显式 `git clone -b master` |
-| `make` 1 秒结束、没有产物 | Makefile 里 `sync-resources` 排在 `all` 前面，GNU make 会把它当默认目标 → 显式 `.DEFAULT_GOAL := all` |
-| borealis(master) 用了新版 libnx 已删除的 `swkbdConfigSetStringLenMaxExt` | CI 里 sed 换成 `swkbdConfigSetStringLenMax` |
-| borealis(master) 左摇杆不能导航（源码里只有一句 TODO） | CI 里在 `application.cpp` 的 TODO 处注入左摇杆 → `Application::navigate()`（死区 0.5、180ms 重复、弹窗期间不生效） |
+| 界面卡死 | v2.2.0 已移除收尾路径上的「动画回调里改视图栈」。请把 `sdmc:/switch/nx-downloader/log.txt` 发回：日志最后一行的 `[UI]` 面包屑会指出卡在哪个调用（例如停在「任务收尾开始」就说明卡在「读正文 / 改状态行」之间）。 |
+| 启动就提示「网络不可用」 | v2.1.1 起 `LibnxError_AlreadyInitialized`（`0x0F59`）按**成功**处理（它恰恰说明 socket 已经可用）。其它错误码按下面第 6.1 节对照。 |
+| 输入框只能输 32 个字符 | 已修：v2.0.0 的 CI 补丁把 `maxStringLength` 覆盖成了 32，现改成整行删除并加了断言。 |
+| 按 A 输入就死机 | Applet 模式（相册启动）下调系统键盘有风险。v2.1.0 起在 Applet 模式下**不再调用键盘**，请用 `X` / 文件图标，或按住 R 从游戏图标启动。 |
+| 中文显示成方块 | 程序会挂载系统简体中文字体作为 fallback（日志里记录 `plGetSharedFontByType` 的返回值）；主机缺该字体则无解。 |
+| HTTPS 报证书错误 | 设备没有 CA 链时程序会自动降级为「不校验证书」，并在完成提示里注明；要严格校验就把 `cacert.pem` 放到项目文件夹。 |
+| HTTP 4xx/5xx 也报「下载失败」 | 这是刻意的：避免把服务器的错误页面当成文件存下来。 |
+| 下载很慢 / 进度条不动 | 网络太慢或服务器无响应，点「取消当前任务」；超时阈值是 15s 连接、60s 低速。 |
+| 日志里出现「前文过长已丢弃」 | 正常：日志满 24KB 后只保留最近部分（出问题时最后几行最有价值）。 |
 
-触发方式：push 代码，或到 Actions 页面点 **Run workflow**。编译完在运行的 **Artifacts**
-区下载 `nx-downloader-nro.zip`，解压出 `nx-downloader.nro`。
+### 6.1 libnx 错误码
 
----
+`Result` 的编码是 `(module << 9) | description`，可用 `log.txt` 里的 `0x……` 反查：
 
-## 6. 出问题先看日志
-
-程序每次启动都会重建：
-
-```
-sdmc:/switch/nx-downloader/log.txt
-```
-
-里面按顺序记录了每个阶段的**真实返回值**（含 libnx 的 `Result` 错误码），例如：
-
-```
-[01] ===== NX Downloader 启动日志 =====
-[02] 固件/环境: appletType=1
-[03] romfsInit = OK
-[04] fsx::init = OK (sdmc:/switch/nx-downloader)
-[05] 网络初始化：Applet 模式（相册启动）
-[06] nifmInitialize(NifmServiceType_User) = 0x00000000
-[07] 联网状态：已联网（Wi-Fi，信号 3）
-[08] socketInitializeDefault() = OK
-[09] curl_global_init = 0 (No error)
-[10] ensureProjectLayout = OK (新建目录=0 新建url.txt=0)
-[11] Application::init = OK
-[12] 环境：模式=Applet（相册启动），联网=已联网（Wi-Fi，信号 3），socket=正常
-```
-
-主界面上也有一行「环境：…」常驻显示，不用连电脑就能看出是哪一环不对。
-联网失败时还会弹出带错误码的提示（例如 `网络初始化失败 0x00000209`），
-把 log.txt 发回来就能直接定位。
-
-### 已修复 / 已知限制
-
-| 现象 | 原因与处理 |
-| --- | --- |
-| 启动就提示「网络初始化失败 0x00000F59」 | **这不是真的失败**。`0x00000F59` = `MAKERESULT(Module_Libnx=345, 7)` = `LibnxError_AlreadyInitialized`，含义是「本进程里 socket 已经初始化过」。libnx 的 `socket.c` 里 `AddDevice("soc:")` **只在 `bsdInitialize` 成功之后**才执行，所以拿到这个码恰恰说明网络层现成可用。v2.1.1 起按成功处理（旧版把它当失败，等于自己把联网功能禁掉） |
-| 启动就提示「网络初始化失败 0x00000209」等其他码 | 那才是真的失败。已按参考项目补上 `nifmInitialize`，并把降级重试换成**真正更小**的 socket 配置（v2.0.0 的「重试」与默认配置完全相同，等于没有兜底）。确认已连 Wi-Fi、重启主机后再试（上次异常退出可能还占着 bsd 服务） |
-| **运行中随机卡死 / 崩溃（尤其退出时）** | 先看固件版本：**固件 21.0.0 + Atmosphere 1.10.0 起 Nintendo 改了 userland 的 TLS ABI**，用旧版 libnx（< 4.10.0）编出来的 homebrew 会内存损坏 —— 凡是用到线程、C++ 异常（都依赖 TLS）的程序都会中招，hbmenu 会给出 ABI 警告。CI 现在会在编译前把工具链升到最新，并把 `libnx` 版本打进 Step Summary 便于核对 |
-| 按 A 输入就直接死机 | Applet 模式（从相册启动）下系统键盘有风险。v2.1.0 起在 Applet 模式下**不再调用系统键盘**，改用 X / 文件图标读 `url.txt`；需要键盘请按住 R 键从游戏图标启动（完整内存模式） |
-| 输入框最多只能输 32 个字符 | v2.0.0 的 CI 补丁把 `maxStringLength` 覆盖成了 32（见第 5 节说明），v2.1.0 已改成整行删除并加断言 |
-| 中文显示成方块 | 程序会挂载系统简体中文字体作为 fallback；若主机系统字体缺失则无解（日志里会记录 `plGetSharedFontByType` 的返回值） |
-| HTTPS 报证书错误 | 设备上没有 CA 链时，程序会自动降级为不校验证书并在完成提示里注明；要严格校验就把 `cacert.pem` 放到项目文件夹 |
-| HTTP 404 也提示「下载失败」 | 这是刻意的：避免把服务器的错误页面当成文件存下来 |
-| 界面卡在进度框不动 | 网络太慢或服务器无响应，点「取消」；超时阈值是 15s 连接、60s 低速 |
-| Windows Defender 报毒 | `.nro` 不是 Windows 可执行文件，正常不会报；打包 zip 分发若被拦，加白名单即可 |
+- `0x00000F59` = `module 345 (Module_Libnx) | 描述 7 (LibnxError_AlreadyInitialized)`
+  → **不是失败**：`soc:` 设备只在 `bsdInitialize` 成功之后才登记，
+  能拿到这个码恰恰说明 socket 早就初始化好、而且可用。
+- 其它错误码对照 `libnx/nx/include/switch/result.h`。
 
 ---
 
-## 7. 版本
+## 7. 版本历史
 
 | 版本 | 说明 |
 | --- | --- |
 | 1.0.0 | 单行下载器：一个链接输入框 + 保存目录 + 下载按钮 |
-| 2.0.0 | 双行结构：上行检查更新（显示返回内容）、下行下载；启动自动创建项目文件夹与 `url.txt`；`X` 快捷读取；两行各有 txt 选择图标；左摇杆可导航 |
-| **2.1.0** | 修真机问题：① 输入框上限被 CI 补丁覆盖成 32 → 修好（100 字符生效）；② 网络初始化补齐 `nifmInitialize` 并换成真正更小的降级配置，错误码直接显示；③ Applet 模式下禁用系统键盘（避免死机）；④ 新增 `log.txt` 全过程诊断日志；⑤ SD 卡 I/O 串行化（libnx 的 IPC 会话不是并发安全的）；⑥ 去掉输入框每帧的文字测量，改用 scissor 裁剪 |
-| **2.1.1** | 按真机日志定位：`socketInitialize` 返回 `0x00000F59 = LibnxError_AlreadyInitialized`，**被我误判为失败，等于自己禁掉了联网功能** → 改为按成功处理（并保留 socket 层可用性自检日志）；CI 在编译前升级工具链，避免旧 libnx 在固件 21.x / AMS 1.10+ 上的 TLS ABI 内存损坏 |
+| 2.0.0 | 双行结构：上行检查更新、下行下载；启动自动建项目文件夹与 `url.txt`；`X` 快捷读取；两行各有 txt 图标；左摇杆可导航 |
+| 2.1.0 | 修输入框上限被 CI 补丁覆盖成 32；补 `nifmInitialize`；Applet 模式禁用系统键盘；新增 `log.txt`；SD 卡 I/O 串行化；去掉每帧文字测量 |
+| 2.1.1 | `AlreadyInitialized` 按成功处理（网络不再被误禁用）；去掉未导出的 `bsdSocket` 符号；CI 失败时也保证生成 Step Summary |
+| **2.2.0** | **移除收尾路径上的全部动画/视图栈操作（对话框、通知、嵌套 pushView）→ 进度与结果改为页内显示**；工作线程终态最后置位；`fsx` 全部接口统一加锁；修轮询任务每帧都跑；日志满后保留最近部分；新增 UI 面包屑与轮询心跳日志；返回内容另存 `update_result.txt` |

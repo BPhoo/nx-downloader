@@ -134,6 +134,19 @@ jobs:
           PY
           grep -n "左摇杆 -> 上下左右导航" borealis/library/lib/application.cpp
 
+      - name: 4d. 剔除 v2.2.0 起已废弃的源文件
+        # v2.2.0 起「进度条 / 结果」全部改成页内显示（见 source/main_view.cpp），
+        # source/progress_dialog.* 不再参与编译。
+        #
+        # 为什么在 CI 里删而不是直接删仓库里的文件：
+        #   本项目上传代码走的是 GitHub 网页的 /upload 页，那条通道只能
+        #   「新增 / 覆盖」文件，**不能删除**文件。所以把这一步放到流水线里，
+        #   保证产物里一定不含这段死代码。
+        run: |
+          rm -f source/progress_dialog.cpp source/progress_dialog.hpp
+          echo '--- 参与编译的源文件 ---'
+          ls -1 source/
+
       - name: 5. 同步 borealis 运行时资源
         run: |
           set -e

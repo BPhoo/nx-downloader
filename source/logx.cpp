@@ -13,12 +13,13 @@ namespace logx
 namespace
 {
 
-/// 日志上限，超过就不再追加（防止无限增长把 SD 卡写爆）
-constexpr size_t MAX_LOG_BYTES = 32 * 1024;
+/// 日志上限。超过就丢掉前半段（而不是停止记录）：
+/// 出问题时最有价值的是最后几行，静默停止会让诊断反而失效。
+constexpr size_t MAX_LOG_BYTES = 24 * 1024;
 
-// UI 线程和下载工作线程都可能写日志。
-// libnx 的 IPC 会话不是并发安全的，所以这里必须串行化
-// ——否则两个线程同时对同一个 FsFileSystem 会话发请求就是数据竞争。
+// UI 线程和下载工作线程都会写日志。
+// libnx 的 IPC 会话不是并发安全的，而且内存里的缓冲区是 std::string ——
+// 两个线程同时改它就是数据竞争（真机表现：随机死机）。
 std::mutex g_mutex;
 
 std::string g_buffer;
@@ -52,10 +53,15 @@ void line(const std::string& text)
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (g_buffer.size() >= MAX_LOG_BYTES)
-        return;
+    {
+        // 只保留最近的：清空并留一行说明
+        char mark[96];
+        std::snprintf(mark, sizeof(mark), "===== 前文过长已丢弃（序号 %d 之后继续）=====\n", g_sequence);
+        g_buffer.assign(mark);
+    }
 
     char prefix[16];
-    std::snprintf(prefix, sizeof(prefix), "[%02d] ", ++g_sequence);
+    std::snprintf(prefix, sizeof(prefix), "[%03d] ", ++g_sequence);
 
     g_buffer += prefix;
     g_buffer += text;
@@ -77,6 +83,25 @@ void linef(const char* format, ...)
     va_end(args);
 
     line(std::string(buf));
+}
+
+void ui(const std::string& text)
+{
+    line("[UI] " + text);
+}
+
+void uif(const char* format, ...)
+{
+    if (!g_enabled)
+        return;
+
+    char buf[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+
+    ui(std::string(buf));
 }
 
 void open()

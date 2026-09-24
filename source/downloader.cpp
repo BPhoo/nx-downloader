@@ -644,9 +644,37 @@ void Downloader::run()
     if (rc == CURLE_OK)
     {
         prog->percent.store(100);
-        prog->state.store(State::Finished);
+
+        // 取文本模式：把正文落到 SD 卡。
+        // 这样即使界面侧出了任何问题，返回内容也一定拿得到，方便离线查看。
+        if (prog->mode == Mode::ToMemory)
+        {
+            std::string body;
+            bool truncated = false;
+            {
+                std::lock_guard<std::mutex> lock(prog->mtx);
+                body      = prog->body;
+                truncated = prog->truncated;
+            }
+
+            if (body.empty())
+                logx::line("返回内容为空");
+            else if (fsx::writeWholeFile(appcfg::RESULT_FILE, body))
+                logx::linef("返回内容已存入 %s（%u 字节，截断=%d）",
+                    appcfg::RESULT_FILE, static_cast<unsigned>(body.size()), truncated ? 1 : 0);
+            else
+                logx::linef("返回内容写入 %s 失败", appcfg::RESULT_FILE);
+        }
 
         logx::linef("网络任务成功：%s", currentOutputPath(prog.get()).c_str());
+
+        // ★★ 终态必须是**最后一步**。
+        //    UI 线程一旦看到 Finished，就说明工作线程该做的都做完了
+        //    （包括日志落盘、返回内容存盘），此后不会再写任何共享数据 ——
+        //    这是跨线程交接里最重要的一条顺序约定。
+        //    v2.1.1 及以前是先置状态再写日志，UI 可能在 worker 还在写盘时
+        //    就开始处理结果。
+        prog->state.store(State::Finished);
         return;
     }
 
@@ -663,8 +691,10 @@ void Downloader::run()
 
     if (prog->cancelRequested.load())
     {
-        prog->state.store(State::Cancelled);
         logx::line("网络任务被取消");
+
+        // 终态最后置位（同成功路径的理由）
+        prog->state.store(State::Cancelled);
         return;
     }
 
@@ -687,7 +717,9 @@ void Downloader::run()
         setError(prog.get(), text);
     }
 
-    prog->state.store(State::Failed);
-
     logx::linef("网络任务失败：curl=%d (%s)", static_cast<int>(rc), curl_easy_strerror(rc));
+
+    // 终态最后置位（同成功路径的理由）：
+    // UI 看到 Failed 时，error 文本一定已经写好、日志也已经落盘。
+    prog->state.store(State::Failed);
 }

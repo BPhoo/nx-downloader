@@ -56,6 +56,12 @@ bool init()
 
 void exit()
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return;
 
@@ -68,6 +74,12 @@ void exit()
 
 bool exists(const std::string& sdmcPath)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -77,6 +89,12 @@ bool exists(const std::string& sdmcPath)
 
 bool isDirectory(const std::string& sdmcPath)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -89,6 +107,12 @@ bool isDirectory(const std::string& sdmcPath)
 
 bool removeFile(const std::string& sdmcPath)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -99,6 +123,12 @@ bool removeFile(const std::string& sdmcPath)
 
 bool createDirectory(const std::string& sdmcPath)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -113,6 +143,12 @@ bool createDirectory(const std::string& sdmcPath)
 
 bool ensureDirectory(const std::string& sdmcPath)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -204,6 +240,8 @@ void flushAndCloseFile(FsFile* file)
 
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened || names == nullptr)
         return false;
 
@@ -246,6 +284,12 @@ bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* n
 
 bool listDirectory(const std::string& sdmcPath, std::vector<std::string>* dirs, std::vector<std::string>* files)
 {
+    // 所有 SD 卡访问都必须经过同一把锁：
+    //   libnx 的 FsFileSystem 是一个 IPC 会话，**不是并发安全的**。
+    //   下载工作线程在不停地写盘，而 UI 线程同时在写 settings.txt / log.txt，
+    //   两个线程往同一个会话上发请求会导致响应错配 —— 真机表现就是卡死或写坏文件。
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened)
         return false;
 
@@ -304,6 +348,8 @@ bool listDirectory(const std::string& sdmcPath, std::vector<std::string>* dirs, 
 
 bool getFreeSpace(const std::string& sdmcPath, s64* out)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
     if (!g_opened || out == nullptr)
         return false;
 

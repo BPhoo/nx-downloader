@@ -27,6 +27,8 @@ extern const char* SETTINGS_FILE; // "sdmc:/switch/nx-downloader/settings.txt"
 extern const char* CA_BUNDLE; // "sdmc:/switch/nx-downloader/cacert.pem"
 /// 运行日志（每次启动重建，用于真机排错）
 extern const char* LOG_FILE; // "sdmc:/switch/nx-downloader/log.txt"
+/// 检查更新的返回内容（每次检查后覆盖写入，方便离线查看，也是个兜底）
+extern const char* RESULT_FILE; // "sdmc:/switch/nx-downloader/update_result.txt"
 /// 默认下载目录：SD 卡根目录
 extern const char* DEFAULT_OUT_DIR; // "sdmc:/"
 

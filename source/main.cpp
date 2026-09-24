@@ -212,26 +212,33 @@ int main(int argc, char* argv[])
 
     //------------------------------------------------------------------
     // 8. 启动提示
-    //    网络失败时把错误码直接显示出来（而不是只让用户看一句「失败」）
+    //    v2.2.0 起不再用 Application::notify：通知同样是「多一个动画 + 多一个视图」，
+    //    而本轮修复的重点就是把收尾路径上的动画/视图栈操作全部去掉。
+    //    这里改成把要说的话交给主界面，显示在详情区。
     //------------------------------------------------------------------
+    std::string notice;
+
     if (!netx::fullMemoryMode())
-        brls::Application::notify("当前是 Applet 模式（从相册启动）：系统键盘与网络都可能受限，"
-                                  "需要完整功能请按住 R 键从游戏图标启动");
+        notice += "当前是 Applet 模式（从相册启动）：系统键盘会被禁用（有死机风险），"
+                  "需要完整功能请按住 R 键从游戏图标启动。\n\n";
 
     if (!netx::ready())
-        brls::Application::notify("网络初始化失败 " + logx::result(netx::socketError()) +
-                                  "（小配置重试 " + logx::result(netx::retryError()) + "）· 详见 " +
-                                  std::string(appcfg::LOG_FILE));
+        notice += "网络初始化失败 " + logx::result(netx::socketError()) +
+                  "（小配置重试 " + logx::result(netx::retryError()) + "）· 详见 " +
+                  std::string(appcfg::LOG_FILE) + "\n\n";
 
     if (!projectOk)
-        brls::Application::notify("无法创建项目文件夹：" + std::string(appcfg::PROJECT_DIR));
+        notice += "无法创建项目文件夹：" + std::string(appcfg::PROJECT_DIR) + "\n\n";
     else if (createdFile)
-        brls::Application::notify("已生成配置文件 " + std::string(appcfg::URL_FILE));
+        notice += "已生成配置文件 " + std::string(appcfg::URL_FILE) + "（可按 X 读取）\n\n";
+
+    if (!notice.empty())
+        logx::ui("启动提示：" + notice);
 
     //------------------------------------------------------------------
     // 9. 主界面
     //------------------------------------------------------------------
-    brls::Application::pushView(new MainView(&g_downloader));
+    brls::Application::pushView(new MainView(&g_downloader, notice));
 
     while (brls::Application::mainLoop())
         ;
