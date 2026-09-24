@@ -76,7 +76,7 @@ class MainView : public brls::List
     void buildRows();
     void buildStatusArea();
     void buildGallery();
-    void buildFooter();
+    void buildFooter(const std::string& startupNotice);
 
     void openTextFilePicker(bool forUpdate);
     void openOutputDirPicker();
