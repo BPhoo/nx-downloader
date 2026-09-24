@@ -51,6 +51,17 @@ bool init()
 
     g_sd     = fs;
     g_opened = true;
+
+    // 顺便把 "sdmc:" 挂到 devoptab 上。
+    //
+    // 为什么需要它：本程序自己的读写都走上面的 FsFileSystem 裸接口（更可控，
+    // 也不会因为 hbmenu 已挂载过 sdmc 而失败），但**第三方库**（比如 borealis /
+    // nanovg 读图片文件、stb_image 里面的 fopen）走的是 stdio —— 没有 devoptab
+    // 它们一律 fopen 失败。真机/模拟器上「图片已加载却什么都不显示」就是这么来的：
+    // nvgCreateImage 内部 fopen 失败 → 返回纹理 0 → 画出来是一片空白。
+    // 挂载本身很轻（就是多开一个 SD 卡会话），失败也不影响已有功能。
+    fsdevMountSdmc();
+
     return true;
 }
 
@@ -423,6 +434,68 @@ bool readWholeFile(const std::string& sdmcPath, std::string* out)
 
     out->resize(static_cast<size_t>(read));
     return true;
+}
+
+bool readBinaryFile(const std::string& sdmcPath, std::string* out, size_t maxBytes)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
+    if (!g_opened || out == nullptr)
+        return false;
+
+    out->clear();
+
+    FsFile file = {};
+    if (R_FAILED(fsFsOpenFile(&g_sd, toFsPath(sdmcPath).c_str(), FsOpenMode_Read, &file)))
+        return false;
+
+    s64 size = 0;
+    if (R_FAILED(fsFileGetSize(&file, &size)) || size <= 0)
+    {
+        fsFileClose(&file);
+        return false;
+    }
+
+    // 超过上限**直接失败**，绝不截断：截断后的 JPEG/PNG 会被解码成半边图像，
+    // 比明确报错更难查。
+    if (static_cast<size_t>(size) > maxBytes)
+    {
+        fsFileClose(&file);
+        return false;
+    }
+
+    out->resize(static_cast<size_t>(size));
+
+    u64 read = 0;
+    Result rc = fsFileRead(&file, 0, &(*out)[0], static_cast<u64>(size), FsReadOption_None, &read);
+    fsFileClose(&file);
+
+    if (R_FAILED(rc) || read == 0)
+    {
+        out->clear();
+        return false;
+    }
+
+    out->resize(static_cast<size_t>(read));
+    return true;
+}
+
+s64 fileSize(const std::string& sdmcPath)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
+
+    if (!g_opened)
+        return -1;
+
+    FsFile file = {};
+    if (R_FAILED(fsFsOpenFile(&g_sd, toFsPath(sdmcPath).c_str(), FsOpenMode_Read, &file)))
+        return -1;
+
+    s64 size = 0;
+    const Result rc = fsFileGetSize(&file, &size);
+    fsFileClose(&file);
+
+    return R_SUCCEEDED(rc) ? size : -1;
 }
 
 bool writeWholeFile(const std::string& sdmcPath, const std::string& data)

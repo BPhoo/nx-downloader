@@ -75,6 +75,16 @@ bool getFreeSpace(const std::string& sdmcPath, s64* out);
 /// 读取整个文本文件（超过 64KB 只读前 64KB）
 bool readWholeFile(const std::string& sdmcPath, std::string* out);
 
+/// 读取整个**二进制**文件（图片用）。
+///
+/// 与 readWholeFile 的区别：不截断。文件大于 maxBytes 时直接返回 false
+/// （截断后的图片会被解码成半张图，比报错更难排查）。
+/// maxBytes 默认 16MB —— 常见截图/照片够用，也避免把显存撑爆。
+bool readBinaryFile(const std::string& sdmcPath, std::string* out, size_t maxBytes = 16u * 1024u * 1024u);
+
+/// 文件大小（字节）；文件不存在或读取失败返回 -1
+s64 fileSize(const std::string& sdmcPath);
+
 /// 覆盖写入文本文件
 bool writeWholeFile(const std::string& sdmcPath, const std::string& data);
 

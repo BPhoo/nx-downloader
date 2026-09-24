@@ -237,8 +237,13 @@ int main(int argc, char* argv[])
 
     //------------------------------------------------------------------
     // 9. 主界面
+    //    pushView 内部会立刻布局一次整棵视图树（invalidate(true)），
+    //    所以这里前后各写一行日志：真机若在这里崩溃，一眼就能看出是
+    //    「构造」还是「首次布局」出的问题。
     //------------------------------------------------------------------
+    logx::ui("准备 pushView 主界面");
     brls::Application::pushView(new MainView(&g_downloader, notice));
+    logx::ui("pushView 已返回，进入主循环");
 
     while (brls::Application::mainLoop())
         ;

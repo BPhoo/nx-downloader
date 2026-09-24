@@ -50,4 +50,11 @@ void uif(const char* format, ...) __attribute__((format(printf, 1, 2)));
 /// 把 libnx 的 Result 格式化成 "0x%08X"
 std::string result(Result rc);
 
+/// 日志落盘是否曾经失败（SD 卡写入异常）。
+///
+/// 为什么必须暴露它：如果 SD 卡写不进去，日志会**静静地停在上一次成功的那一行**，
+/// 看起来像是「程序死在这一步」，其实只是后面的行没写下来 ——
+/// 上一版真机排查就被这种情况误导过。界面会把它显示出来，别让日志默默变短。
+bool writeFailed();
+
 } // namespace logx

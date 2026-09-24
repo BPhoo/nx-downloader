@@ -26,7 +26,15 @@ std::string g_buffer;
 bool g_enabled = false;
 int g_sequence = 0;
 
+/// 最近一次写盘是否失败（见 logx::writeFailed 的说明）
+bool g_writeFailed = false;
+
 } // namespace
+
+bool writeFailed()
+{
+    return g_writeFailed;
+}
 
 const char* path()
 {
@@ -68,7 +76,27 @@ void line(const std::string& text)
     g_buffer += '\n';
 
     // 整份重写：崩溃/死机时最后一行也已经在盘上
-    fsx::writeWholeFile(appcfg::LOG_FILE, g_buffer);
+    const bool ok = fsx::writeWholeFile(appcfg::LOG_FILE, g_buffer);
+
+    if (!ok)
+    {
+        // 写不进去就标记出来（界面会显示）。
+        // 内部缓冲区**故意不同步**：只要后续某次写成功，恢复说明这一行也会一起落盘，
+        // 于是「日志为什么变短」在日志里也有答案。
+        if (!g_writeFailed)
+        {
+            g_writeFailed = true;
+            g_buffer += "[!] 日志写入 SD 卡失败：以下内容可能都没能落盘\n";
+        }
+        return;
+    }
+
+    if (g_writeFailed)
+    {
+        g_writeFailed = false;
+        g_buffer += "[!] 日志写入已恢复（之前有内容丢失）\n";
+        fsx::writeWholeFile(appcfg::LOG_FILE, g_buffer);
+    }
 }
 
 void linef(const char* format, ...)

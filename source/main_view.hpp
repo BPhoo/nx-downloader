@@ -42,6 +42,7 @@
 #include "downloader.hpp"
 
 class InputRow;
+class RemoteImageView;
 
 class MainView : public brls::List
 {
@@ -66,9 +67,16 @@ class MainView : public brls::List
     /// 一个图片位：先看本地缓存，没有再联网下载
     struct ImageSlot
     {
-        brls::Image* view = nullptr;
-        std::string item;   // url.txt 里那一项的原文（http(s) 链接 或 本地文件名）
-        std::string cached; // 本地文件路径（sdmc: 开头）
+        // ★ 用自己实现 RemoteImageView，而**不是** brls::Image：
+        //   brls::Image 走 nvgCreateImage(path) → 内部 fopen，需要 sdmc: 的 devoptab；
+        //   而且它有个真机坑 —— View::layout 会把首次布局时的高度缓存进 origViewHeight，
+        //   而 Application::pushView 会强制先布局一次（那时图片还处于折叠状态、高度 0），
+        //   于是 0 被永久缓存，再用 0×0 的纹理尺寸算出 0/0 = NaN 的缩放比。
+        //   自绘的视图没有这些问题：纹理为空就不画，尺寸全部用整数，绝不产生 NaN。
+        RemoteImageView* view = nullptr;
+        std::string item;     // url.txt 里那一项的原文（http(s) 链接 或 本地文件名）
+        std::string cached;   // 本地文件路径（sdmc: 开头）
+        std::string note;     // 这一格的状态说明（给诊断页用）
         bool pending = false; // 需要联网下载
         bool loaded  = false; // 已经加载进 view
     };
@@ -98,6 +106,12 @@ class MainView : public brls::List
     void refreshImageSummary();
     /// 找下一张待下载的图片并开始下载；没有则返回 false
     bool startNextPendingImage();
+
+    /// 把启动提示（Applet 模式 / 网络失败 / 新建了 url.txt）显示出来。
+    /// 放在界面已经跑起来之后（第一次轮询）而不是构造函数里 ——
+    /// 这样构造函数在 Applet 模式与完整内存模式下做的事**完全一样**，
+    /// 出问题时不会因为「多建了一个 Label」而分不清是哪条路径崩的。
+    void showStartupNotice();
 
     void setButtonsEnabled(bool enabled);
     void setCancelEnabled(bool enabled);
@@ -141,6 +155,16 @@ class MainView : public brls::List
     bool startupImagesStarted = false;
     int imagesLoaded = 0;
     int imagesFailed = 0;
+
+    /// 已经加载进显存的像素总量（用来看住 Applet 模式下的显存/内存预算）
+    size_t imagePixelsUsed = 0;
+
+    /// 启动提示（构造函数只存起来，第一次轮询才显示）
+    std::string startupNotice;
+    bool noticeShown = false;
+
+    /// 页面出现后已经轮询了多少次（第一次轮询 ≈ 第一帧之后）
+    int aliveTicks = 0;
 
     /// 下载保存目录，默认 SD 卡根目录
     std::string outputDir = "sdmc:/";

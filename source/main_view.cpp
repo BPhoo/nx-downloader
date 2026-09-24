@@ -38,8 +38,22 @@ constexpr size_t MAX_RESULT_DISPLAY = 2000;
 /// 最多加载几张图片（每张都要占显存，别放任用户写一长串）
 constexpr size_t MAX_IMAGES = 6;
 
-/// 图片显示高度（宽度由 List 给，按 FIT 缩放居中）
+/// 图片显示高度（宽度由 List 给，按等比缩放居中）
 constexpr unsigned IMAGE_VIEW_HEIGHT = 300;
+
+/// 单张图片文件的字节上限：超过就跳过（绝不截断 —— 半张图比报错更难查）
+constexpr size_t MAX_IMAGE_BYTES = 12u * 1024u * 1024u;
+
+/// 单张图片的像素上限（4M 像素 ≈ 16MB 显存）。相机大图能到 8~12M 像素，
+/// 直接拒掉远好过把显存/内存吃光（Applet 模式内存小得多）。
+constexpr size_t MAX_IMAGE_PIXELS_EACH = 4u * 1024u * 1024u;
+
+/// 图片占用的**总**像素预算：完整内存模式可以放宽，Applet 模式必须保守
+constexpr size_t MAX_IMAGE_PIXELS_FULL   = 16u * 1024u * 1024u;
+constexpr size_t MAX_IMAGE_PIXELS_APPLET = 6u * 1024u * 1024u;
+
+/// 图片圆角
+constexpr float IMAGE_CORNER_RADIUS = 8.0f;
 
 /// 诊断页里最多显示多少字节的返回内容
 constexpr size_t MAX_DETAIL_BYTES = 6000;
@@ -121,6 +135,12 @@ bool looksLikeUrl(const std::string& s)
     }();
 
     return lower.compare(0, 7, "http://") == 0 || lower.compare(0, 8, "https://") == 0;
+}
+
+/// 图片占用的总像素预算（Applet 模式内存小得多，必须更保守）
+size_t imagePixelBudget()
+{
+    return netx::fullMemoryMode() ? MAX_IMAGE_PIXELS_FULL : MAX_IMAGE_PIXELS_APPLET;
 }
 
 } // namespace
@@ -304,19 +324,44 @@ class InputRow : public BoxLayout
         this->addView(this->input);
 
         this->fileButton = new Button(ButtonStyle::REGULAR);
-        this->fileButton->setImage(BOREALIS_ASSET("icon/txt.png"));
         this->addView(this->fileButton);
 
         if (withFolderButton)
         {
             this->folderButton = new Button(ButtonStyle::REGULAR);
-            this->folderButton->setImage(BOREALIS_ASSET("icon/folder.png"));
             this->addView(this->folderButton);
         }
 
         this->goButton = new Button(ButtonStyle::PRIMARY);
         this->goButton->setLabel("访问");
         this->addView(this->goButton);
+
+        //---------------------------------------------------------------------------
+        // ★ 这里刻意**不**加载图标。
+        //
+        //   Button::setImage() 会立刻创建 GL 纹理（nvgCreateImage → glGenTextures /
+        //   glTexImage2D），而 MainView 的构造函数是本程序唯一会在「第一帧之前」
+        //   碰 GPU 的地方 —— 真机 Applet 模式（从相册启动）下，恰恰就是在这段区间里
+        //   一启动就死机（日志停在构造函数之前/之中，一条构造日志都没有）。
+        //   改成首帧之后再补图标（肉眼完全看不出差别），构造函数里就彻底不碰 GPU 了。
+        //   加载结果同样写进日志：这样「GL 调用到底安不安全」下次就有结论了。
+        //---------------------------------------------------------------------------
+    }
+
+    /// 补上两个图标按钮的贴图（幂等）。首帧之后调用。
+    void loadIcons()
+    {
+        if (this->iconsLoaded)
+            return;
+
+        this->iconsLoaded = true;
+
+        this->fileButton->setImage(BOREALIS_ASSET("icon/txt.png"));
+
+        if (this->folderButton != nullptr)
+            this->folderButton->setImage(BOREALIS_ASSET("icon/folder.png"));
+
+        this->invalidate();
     }
 
     void layout(NVGcontext* vg, Style* style, FontStash* stash) override
@@ -352,6 +397,167 @@ class InputRow : public BoxLayout
     Button* fileButton   = nullptr;
     Button* folderButton = nullptr;
     Button* goButton     = nullptr;
+
+    /// 图标是否已经补上（见构造函数里那段说明）
+    bool iconsLoaded = false;
+};
+
+//=====================================================================
+// 图片视图（自绘，替代 brls::Image）
+//
+// 为什么不用 brls::Image：
+//   ① 它只接受「文件路径」，内部走 nvgCreateImage(path) → stb_image 的 fopen。
+//      本程序的 SD 卡访问一直走裸 FsFileSystem（更可控），sdmc: 并没有挂在
+//      devoptab 上，于是 fopen 失败、nvgCreateImage 返回 0 —— **而且不报错**。
+//      真机与模拟器上呈现的就是「日志说 4/4 已加载，屏幕上却什么都没有」。
+//   ② 它的 layout() 会把「首次布局时的高度」缓存进 origViewHeight。而
+//      Application::pushView() 里会先 `view->invalidate(true)` 强制布局一次 ——
+//      那一刻图片还处于折叠状态（高度 0），0 就被永久缓存了；再用 0×0 的纹理
+//      尺寸算出 0/0 = NaN 的缩放比，把 NaN 一路灌进 paint 与 setHeight。
+//      真机上的表现就是随机崩/白屏，且很难查。
+//
+// 自己画就没有这些坑：字节自己读（fsx 的裸接口）、失败有明确返回值、
+// 尺寸全部用整数、纹理为空就什么都不画。
+//=====================================================================
+class RemoteImageView : public brls::View
+{
+  public:
+    enum class LoadResult
+    {
+        Ok = 0,
+        ReadFailed,     // 文件读不到（不存在 / SD 卡错误）
+        TooBigFile,     // 文件超过 MAX_IMAGE_BYTES
+        DecodeFailed,   // 不是能解码的图片（或损坏）
+        TooManyPixels,  // 分辨率太高，放弃
+    };
+
+    RemoteImageView()
+    {
+        // 固定高度，宽度由 List 给；不可聚焦（View::getDefaultFocus 默认返回 nullptr）
+        this->setHeight(IMAGE_VIEW_HEIGHT);
+        // 先收起：等真的解码成功再展开，失败时不会留下一大片空白
+        this->collapse(false);
+    }
+
+    ~RemoteImageView() override
+    {
+        this->unload();
+    }
+
+    LoadResult loadFromFile(const std::string& sdmcPath, size_t maxPixels)
+    {
+        this->unload();
+
+        NVGcontext* vg = brls::Application::getNVGContext();
+        if (vg == nullptr)
+            return LoadResult::DecodeFailed;
+
+        const s64 fileBytes = fsx::fileSize(sdmcPath);
+        if (fileBytes <= 0)
+            return LoadResult::ReadFailed;
+
+        if (static_cast<size_t>(fileBytes) > MAX_IMAGE_BYTES)
+            return LoadResult::TooBigFile;
+
+        std::string bytes;
+        if (!fsx::readBinaryFile(sdmcPath, &bytes, MAX_IMAGE_BYTES))
+            return LoadResult::ReadFailed;
+
+        // 自己解码：nvgCreateImageMem 内部是 stb_image，JPEG / PNG 都支持
+        const int tex = nvgCreateImageMem(vg, 0, reinterpret_cast<unsigned char*>(&bytes[0]),
+            static_cast<int>(bytes.size()));
+        if (tex <= 0)
+            return LoadResult::DecodeFailed;
+
+        // 问出真实尺寸：0×0 说明这文件根本不是能解码的图片（此时纹理必须删掉）
+        int w = 0;
+        int h = 0;
+        nvgImageSize(vg, tex, &w, &h);
+        if (w <= 0 || h <= 0)
+        {
+            nvgDeleteImage(vg, tex);
+            return LoadResult::DecodeFailed;
+        }
+
+        const size_t px = static_cast<size_t>(w) * static_cast<size_t>(h);
+        if (px > maxPixels)
+        {
+            nvgDeleteImage(vg, tex);
+            return LoadResult::TooManyPixels;
+        }
+
+        this->texture   = tex;
+        this->texWidth  = w;
+        this->texHeight = h;
+        return LoadResult::Ok;
+    }
+
+    void unload()
+    {
+        if (this->texture > 0)
+        {
+            NVGcontext* vg = brls::Application::getNVGContext();
+            if (vg != nullptr)
+                nvgDeleteImage(vg, this->texture);
+        }
+
+        this->texture   = -1;
+        this->texWidth  = 0;
+        this->texHeight = 0;
+    }
+
+    bool ready() const
+    {
+        return this->texture > 0 && this->texWidth > 0 && this->texHeight > 0;
+    }
+
+    int textureWidth() const { return this->texWidth; }
+    int textureHeight() const { return this->texHeight; }
+
+    /// 占用的像素数（用来算显存预算）
+    size_t pixels() const
+    {
+        return static_cast<size_t>(this->texWidth) * static_cast<size_t>(this->texHeight);
+    }
+
+    void draw(NVGcontext* vg, int x, int y, unsigned width, unsigned height, Style* style,
+        FrameContext* ctx) override
+    {
+        if (!this->ready() || width == 0 || height == 0)
+            return;
+
+        const float viewW = static_cast<float>(width);
+        const float viewH = static_cast<float>(height);
+        const float ratio = static_cast<float>(this->texWidth) / static_cast<float>(this->texHeight);
+        if (!(ratio > 0.0f))
+            return;
+
+        // 等比缩放到视图内并居中（FIT）
+        float drawW = viewW;
+        float drawH = viewW / ratio;
+        if (drawH > viewH)
+        {
+            drawH = viewH;
+            drawW = viewH * ratio;
+        }
+
+        // 保险：任何一步算出非正数就不画（宁可空白也不把非法数值交给 GPU）
+        if (!(drawW > 0.0f) || !(drawH > 0.0f))
+            return;
+
+        const float offX = static_cast<float>(x) + (viewW - drawW) / 2.0f;
+        const float offY = static_cast<float>(y) + (viewH - drawH) / 2.0f;
+
+        nvgBeginPath(vg);
+        nvgRoundedRect(vg, offX, offY, drawW, drawH, IMAGE_CORNER_RADIUS);
+        nvgFillPaint(vg, nvgImagePattern(vg, offX, offY, drawW, drawH, 0.0f, this->texture, 1.0f));
+        nvgFill(vg);
+    }
+
+  private:
+    int texture   = -1;
+    int texWidth  = 0;
+    int texHeight = 0;
 };
 
 namespace
@@ -488,27 +694,47 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     : List()
     , downloader(downloader)
 {
+    //-----------------------------------------------------------------
+    // 构造函数里每一步都留一行日志。
+    // 真机崩溃时，日志的**最后一行**就指明了死在哪一步 ——
+    // 上一版构造函数里一行日志都没有，日志停在 pushView 之前，
+    // 完全看不出是构造的哪一段出的问题（只能靠猜，代价是一轮一轮试）。
+    //-----------------------------------------------------------------
+    logx::ui("构造：读设置");
     this->readSettings();
 
     if (!this->savedDir.empty())
         this->outputDir = fsx::normalize(this->savedDir);
 
+    logx::ui("构造：标题");
     this->addView(new Header("NX Downloader", true, "上行检查更新 · 下行下载文件"));
 
+    logx::ui("构造：两行");
     this->buildRows();
+
+    logx::ui("构造：状态区");
     this->buildStatusArea();
+
+    logx::ui("构造：图片位");
     this->buildGallery();
+
+    logx::ui("构造：底部");
     this->buildFooter(startupNotice);
 
+    logx::ui("构造：按钮状态");
     this->setButtonsEnabled(true);
     this->setCancelEnabled(false);
 
-    if (!this->savedUpdate.empty())
-        this->updateRow->input->setText(appcfg::normalizeUrl(this->savedUpdate));
-    if (!this->savedDownload.empty())
-        this->downloadRow->input->setText(appcfg::normalizeUrl(this->savedDownload));
+    if (!this->savedUpdate.empty() || !this->savedDownload.empty())
+    {
+        logx::ui("构造：恢复上次的链接");
+        if (!this->savedUpdate.empty())
+            this->updateRow->input->setText(appcfg::normalizeUrl(this->savedUpdate));
+        if (!this->savedDownload.empty())
+            this->downloadRow->input->setText(appcfg::normalizeUrl(this->savedDownload));
+    }
 
-    // 轮询任务常驻：空闲时 onPoll() 第一行就返回，代价只是每 100ms 读几个原子量
+    logx::ui("构造：轮询任务");
     PollTask* poll = new PollTask(this);
     poll->start();
     this->pollTask = poll;
@@ -637,28 +863,28 @@ void MainView::buildGallery()
         ImageSlot slot;
         slot.item = items[i];
 
-        slot.view = new Image();
-        slot.view->setHeight(IMAGE_VIEW_HEIGHT);
-        slot.view->setScaleType(ImageScaleType::FIT);
-        // 先收起：等图片真的加载出来再展开，避免失败时留下一大片空白
-        slot.view->collapse(false);
+        // 自绘的图片位：先收起，等真解码成功再展开
+        slot.view = new RemoteImageView();
 
         this->addView(slot.view);
         this->imageSlots.push_back(slot);
     }
 
     if (!items.empty())
-        logx::uif("img: 共 %u 项", static_cast<unsigned>(items.size()));
+        logx::uif("img: 共 %u 项，图片位已建立", static_cast<unsigned>(items.size()));
 }
 
 void MainView::buildFooter(const std::string& startupNotice)
 {
+    // ★ 启动提示这里**只存不显示**。
+    //   「Applet 模式」这类提示只在相册启动时有，如果它在构造函数里多建一个 Label，
+    //   两种启动模式下构造出来的视图树就不一样了 —— 真机一崩就没法判断是哪条路径的问题。
+    //   显示统一放到界面跑起来之后（showStartupNotice）。
+    this->startupNotice = startupNotice;
+
     this->dirLabel = new Label(LabelStyle::DESCRIPTION,
         "下载保存到：" + this->outputDir + "（第二行的文件夹图标可更换）", true);
     this->addView(this->dirLabel);
-
-    if (!startupNotice.empty())
-        this->addView(new Label(LabelStyle::DESCRIPTION, startupNotice, true));
 
     //-----------------------------------------------------------------
     // ★ 底部锚点：borealis 的 List 只会「滚动到当前焦点」，页面最底下如果
@@ -764,6 +990,27 @@ void MainView::heartbeat()
 
 //------------------------------ 图片 ------------------------------//
 
+/// 把 RemoteImageView::LoadResult 翻成给用户看的话
+static std::string describeLoadResult(RemoteImageView::LoadResult result, s64 fileBytes)
+{
+    switch (result)
+    {
+        case RemoteImageView::LoadResult::Ok:
+            return "已加载";
+        case RemoteImageView::LoadResult::ReadFailed:
+            return "读不到文件（不存在或 SD 卡错误）";
+        case RemoteImageView::LoadResult::TooBigFile:
+            return "文件太大（" + fsx::formatBytes(fileBytes) + "，上限 " +
+                   fsx::formatBytes(static_cast<s64>(MAX_IMAGE_BYTES)) + "）";
+        case RemoteImageView::LoadResult::TooManyPixels:
+            return "分辨率太高（上限 " + std::to_string(MAX_IMAGE_PIXELS_EACH / 1000000u) +
+                   "M 像素），换小图再试";
+        case RemoteImageView::LoadResult::DecodeFailed:
+        default:
+            return "不是能解码的图片（损坏 / 不是 JPEG·PNG）";
+    }
+}
+
 void MainView::loadImageIntoSlot(size_t index, const std::string& path)
 {
     if (index >= this->imageSlots.size())
@@ -771,21 +1018,61 @@ void MainView::loadImageIntoSlot(size_t index, const std::string& path)
 
     ImageSlot& slot = this->imageSlots[index];
 
-    slot.cached = path;
-    slot.view->setImage(path);
-    slot.view->expand(false); // 展开成固定高度，交给 FIT 缩放
+    const s64 fileBytes = fsx::fileSize(path);
+    const RemoteImageView::LoadResult result = slot.view->loadFromFile(path, MAX_IMAGE_PIXELS_EACH);
 
-    slot.loaded  = true;
+    if (result != RemoteImageView::LoadResult::Ok)
+    {
+        slot.loaded  = false;
+        slot.pending = false;
+        slot.note    = describeLoadResult(result, fileBytes);
+        this->imagesFailed++;
+
+        logx::uif("图片 %u 加载失败：%s（%s，%lld 字节）", static_cast<unsigned>(index + 1),
+            path.c_str(), slot.note.c_str(), static_cast<long long>(fileBytes));
+
+        // 失败就保持收起：不留空白
+        this->invalidate();
+        return;
+    }
+
+    // 总预算：Applet 模式下显存/内存都紧张，宁可少显示几张
+    const size_t px     = slot.view->pixels();
+    const size_t budget = imagePixelBudget();
+
+    if (this->imagePixelsUsed + px > budget)
+    {
+        slot.view->unload();
+        slot.loaded  = false;
+        slot.pending = false;
+        slot.note    = "显存预算已用完，跳过（已用 " + std::to_string(this->imagePixelsUsed / 1000000u) +
+                       "M / 上限 " + std::to_string(budget / 1000000u) + "M 像素）";
+        this->imagesFailed++;
+
+        logx::uif("图片 %u 跳过：%s", static_cast<unsigned>(index + 1), slot.note.c_str());
+        this->invalidate();
+        return;
+    }
+
+    this->imagePixelsUsed += px;
+
+    slot.cached = path;
+    slot.loaded = true;
     slot.pending = false;
+    slot.note   = "已加载（" + std::to_string(slot.view->textureWidth()) + "×" +
+                  std::to_string(slot.view->textureHeight()) + "）";
+
+    slot.view->expand(false); // 展开成固定高度
 
     this->imagesLoaded++;
 
     // ⚠️ borealis 的 `View::invalidate(bool)` **不会**往上通知父级
     //    （它只置自己的 dirty）。展开/换图之后必须显式让 List 重新排版，
-    //    否则这一格仍然按 0 高度排位，图片会盖在下面的控件上。
+    //    否则这一格仍然按 0 高度排位，内容会被下面的控件盖住。
     this->invalidate();
 
-    logx::uif("图片 %u 已加载：%s", static_cast<unsigned>(index + 1), path.c_str());
+    logx::uif("图片 %u 已加载：%s（%d×%d）", static_cast<unsigned>(index + 1), path.c_str(),
+        slot.view->textureWidth(), slot.view->textureHeight());
 }
 
 void MainView::refreshImageSummary()
@@ -818,6 +1105,11 @@ void MainView::startStartupImageLoad()
 
     if (this->imageSlots.empty())
         return;
+
+    logx::uif("图片加载开始：共 %u 项，显存预算 %.0fM 像素（模式=%s）",
+        static_cast<unsigned>(this->imageSlots.size()),
+        static_cast<double>(imagePixelBudget()) / 1000000.0,
+        netx::fullMemoryMode() ? "完整内存" : "Applet");
 
     // 先把「本地已经有」的图片直接加载进来（不联网）
     for (size_t i = 0; i < this->imageSlots.size(); i++)
@@ -860,6 +1152,7 @@ void MainView::startStartupImageLoad()
         else
         {
             logx::uif("图片 %u 找不到本地文件：%s", static_cast<unsigned>(i + 1), slot.item.c_str());
+            slot.note = "找不到本地文件（不是链接，也没在项目文件夹 / SD 根目录里找到）";
             this->imagesFailed++;
         }
     }
@@ -921,6 +1214,41 @@ bool MainView::startNextPendingImage()
     return false;
 }
 
+//------------------------------ 启动提示 ------------------------------//
+
+void MainView::showStartupNotice()
+{
+    if (this->noticeShown)
+        return;
+
+    this->noticeShown = true;
+
+    // 首帧已经画出来了，这时候才补按钮图标（构造函数里不碰 GPU，见 InputRow 的说明）
+    if (this->updateRow != nullptr)
+        this->updateRow->loadIcons();
+    if (this->downloadRow != nullptr)
+        this->downloadRow->loadIcons();
+    logx::ui("首帧之后：按钮图标已补上（GL 纹理创建正常）");
+
+    // 日志写不进去时**必须在屏幕上说出来**：
+    // 否则日志会静静地停在上一次成功的那一行，看起来像「程序死在这一步」。
+    if (logx::writeFailed())
+    {
+        logx::ui("界面提示：日志写入失败");
+
+        this->setStatus("⚠ 日志写入失败");
+        this->setDetail("⚠ 无法写入 SD 卡日志：\n" + std::string(appcfg::LOG_FILE) +
+                        "\n\n如果程序随后异常退出，请把屏幕上的内容一并告诉我 —— 日志文件可能不完整。");
+        return;
+    }
+
+    if (!this->startupNotice.empty())
+    {
+        this->setStatus("就绪（有启动提示）");
+        this->setDetail(this->startupNotice);
+    }
+}
+
 //------------------------------ 文件 / 目录选择 ------------------------------//
 
 void MainView::openTextFilePicker(bool forUpdate)
@@ -956,6 +1284,9 @@ void MainView::openDetailsView()
         if (this->imagesFailed > 0)
             summary += "，" + std::to_string(this->imagesFailed) + " 张失败";
 
+        summary += "（显存 " + std::to_string(this->imagePixelsUsed / 1000000u) + "M/" +
+                   std::to_string(imagePixelBudget() / 1000000u) + "M 像素）";
+
         detail.clear();
         for (size_t i = 0; i < this->imageSlots.size(); i++)
         {
@@ -965,9 +1296,15 @@ void MainView::openDetailsView()
             if (slot.loaded)
                 detail += "   → 已加载：" + slot.cached + "\n";
             else
-                detail += "   → 未加载\n";
+                detail += "   → 未加载" + (slot.note.empty() ? "" : "：" + slot.note) + "\n";
         }
     }
+
+    if (logx::writeFailed())
+        detail += "\n⚠ 日志写入失败（SD 卡），log.txt 可能不完整。\n";
+
+    if (!this->startupNotice.empty())
+        detail += "\n启动提示：\n" + this->startupNotice;
 
     Application::pushView(new DetailsView(summary, detail));
 }
@@ -1208,8 +1545,20 @@ void MainView::onPoll()
     if (this->downloader == nullptr)
         return;
 
-    // 启动后第一次轮询：加载图片（界面这时已经画出来了）
-    if (!this->startupImagesStarted)
+    this->aliveTicks++;
+
+    // 前几次轮询写进日志：这是「渲染循环确实活着」最直接的证据。
+    // 真机崩溃时，日志里有没有这几行，能立刻区分「主循环没跑起来」和「跑起来之后才出事」。
+    if (this->aliveTicks <= 5)
+        logx::uif("轮询第 %d 次（主循环正常）", this->aliveTicks);
+
+    // 第一次轮询 ≈ 第一帧之后：这时候才动界面文案 / 读 url.txt / 碰图片
+    if (this->aliveTicks == 1)
+        this->showStartupNotice();
+
+    // 图片加载刻意推迟到第 3 次轮询（约 300ms）：那时界面已经稳稳画了几帧，
+    // 万一图片这条路上有问题，日志能明确区分「界面还没起来」和「界面起来后碰图片才出事」。
+    if (!this->startupImagesStarted && this->aliveTicks >= 3)
     {
         this->startStartupImageLoad();
         return;
