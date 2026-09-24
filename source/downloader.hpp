@@ -55,11 +55,13 @@ class Downloader
         Mode mode = Mode::ToFile;
 
         //------------------------- 以下字段必须持 mtx 访问 -------------------------
-        // url / destDir 是个例外：它们只在 start() 里写一次，且写入发生在
-        // 创建线程之前，因此工作线程读取它们是安全的（有 happens-before 保证）。
+        // url / destDir / forcedFileName 是个例外：它们只在 start() 里写一次，且写入
+        // 发生在创建线程之前，因此工作线程读取它们是安全的（有 happens-before 保证）。
         std::mutex mtx;
         std::string url;
         std::string destDir;
+        /// 调用方指定的落盘文件名（为空则照常从 Content-Disposition / URL 推断）
+        std::string forcedFileName;
         std::string fileName;
         std::string outputPath;
         std::string finalUrl;
@@ -78,6 +80,11 @@ class Downloader
 
     /// 开始下载。url 必须是 http/https，destDirectory 形如 "sdmc:/downloads"
     bool start(const std::string& url, const std::string& destDirectory);
+
+    /// 与 start() 相同，但指定落盘文件名。
+    /// 图片缓存需要「可预测的文件名」，下次启动才能直接判断本地是否已有，
+    /// 不必每次都重新下载。
+    bool startAs(const std::string& url, const std::string& destDirectory, const std::string& fileName);
 
     /// 拉取文本（检查更新用）：响应体读进内存，不写 SD 卡
     bool startFetchText(const std::string& url);
@@ -112,7 +119,8 @@ class Downloader
     static bool isSupportedUrl(const std::string& url);
 
   private:
-    bool startInternal(const std::string& url, const std::string& destDirectory, Mode mode);
+    bool startInternal(const std::string& url, const std::string& destDirectory, Mode mode,
+        const std::string& forcedFileName = "");
 
     // pthread 入口：C++ 调用约定与 void*(*)(void*) 兼容（ARM/EABI 上无差别）
     static void* threadEntry(void* arg);

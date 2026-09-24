@@ -1,46 +1,42 @@
 /*
     NX Downloader - 主界面
 
-    界面结构（严格两行链接行 + 下方状态区）：
+    界面结构（v2.3.0）：
 
-      更新链接  [ 输入框 ]  [ 选 txt 图标 ]              [ 访问 ]
-      下载链接  [ 输入框 ]  [ 选 txt 图标 ] [ 选目录图标 ] [ 访问 ]
-      状态：……                     ← 一行状态（正在检查更新… / 下载完成 …）
-      [ 进度条 ]
-      [ 取消当前任务 ]
-      详情 / 返回内容：……          ← 多行，检查更新的返回内容、错误详情都写这里
-      下载保存到：……（第二行的文件夹图标可更换）
-      提示 …… · 运行环境 …… · 日志路径 ……
+      ┌ NX Downloader ──────────────────────────────────────────┐
+        更新链接  [ 输入框 ]  [ 选 txt 图标 ]              [ 访问 ]
+        下载链接  [ 输入框 ]  [ 选 txt 图标 ] [ 选目录图标 ] [ 访问 ]
+        状态：……
+        [ 进度条 ]
+        [ 取消当前任务 ]          ← 有任务时才出现，平时不可聚焦
+        详情 / 返回内容：……
+        图片：……                  ← url.txt 里 img: 的加载情况
+        [ 图片 1 ]  [ 图片 2 ] ……  ← 固定高度的图片位（不可聚焦）
+        下载保存到：sdmc:/（第二行的文件夹图标可更换）
+        [ 诊断信息与提示 ]         ← 底部锚点：可聚焦，保证能滚到最底
+      └─────────────────────────────────────────────────────────┘
 
     交互：
       * A                打开系统键盘手动输入链接（最长 100 字符，无下限）
       * X                直接读「项目文件夹/url.txt」里对应的值
-                         （第一行读 updata，第二行读 download）
       * 文件图标         打开 txt 选择器，把选中文件里的对应字段填进该行输入框
       * 目录图标（仅第二行）选择下载保存目录，默认 SD 卡根目录
-      * 十字键 / 左摇杆  移动焦点
-      * +                退出
+      * 十字键 / 左摇杆  移动焦点；+ 退出
 
-    ★ v2.2.0 的设计铁律（这是真机「网络成功后整个界面冻死」的修复核心）：
-      工作线程运行期间以及收尾时，**绝不改动视图栈**。
-        * 不使用 Dialog；
-        * 不使用 Application::notify 通知；
-        * 不在任务回调里 pushView / popView。
-      所有进度、结果、错误都只通过改本页面里的 Label 文本来体现
-      （setText 只置脏标记，真正的布局发生在下一帧的绘制阶段，绝不会在
-        动画回调里嵌套触发 pushView/布局）。
-
-      为什么：v2.0.0 / v2.1.x 的收尾路径是
-          RepeatingTask → Dialog::close(cb) → menu_animation 回调 → Application::pushView
-      也就是「在动画回调里改视图栈 + 嵌套动画」。这条路径已经整个删掉。
-      唯一保留 pushView 的地方是「点图标打开文件/目录选择器」这类按键触发的常规路径，
-      而且选择器的回调只改文本、不改视图栈。
+    ★ 两条必须守住的设计铁律
+      1) 工作线程运行期间/收尾时**绝不改动视图栈**：不用 Dialog、不发通知、
+         不在任务回调里 pushView/popView；进度与结果只通过改 Label 文本体现。
+         （v2.0.0/v2.1.x 那种「动画回调里 pushView」的写法正是真机冻死的元凶。）
+         唯一的例外是**按键触发**的常规路径：点图标开选择器、点「诊断信息」翻开详情页。
+      2) 页面最底部必须留一个**可聚焦**的控件。borealis 的 List 只会「滚动到当前焦点」，
+         底部如果没有可聚焦项，再往下就永远滚不动（实测就是「底部内容看不全」）。
 */
 #pragma once
 
 #include <borealis.hpp>
 
 #include <string>
+#include <vector>
 
 #include "app_config.hpp"
 #include "downloader.hpp"
@@ -64,12 +60,27 @@ class MainView : public brls::List
         None = 0,
         Update,
         Download,
+        Images, // 批量下载 url.txt 里 img: 指向的图片
+    };
+
+    /// 一个图片位：先看本地缓存，没有再联网下载
+    struct ImageSlot
+    {
+        brls::Image* view = nullptr;
+        std::string item;   // url.txt 里那一项的原文（http(s) 链接 或 本地文件名）
+        std::string cached; // 本地文件路径（sdmc: 开头）
+        bool pending = false; // 需要联网下载
+        bool loaded  = false; // 已经加载进 view
     };
 
     void buildRows();
+    void buildStatusArea();
+    void buildGallery();
+    void buildFooter();
 
     void openTextFilePicker(bool forUpdate);
     void openOutputDirPicker();
+    void openDetailsView();
 
     void startUpdateCheck();
     void startDownload();
@@ -78,6 +89,15 @@ class MainView : public brls::List
 
     /// 任务进入终态后的一次性收尾（只改文本，不动视图结构）
     void finishTask(Downloader::State state);
+    /// 图片批量的收尾：加载当前这张，然后继续下一张
+    void finishImageTask(Downloader::State state);
+
+    /// 启动后第一次轮询时调用：加载本地已有的图片，并开始下载缺的那些
+    void startStartupImageLoad();
+    void loadImageIntoSlot(size_t index, const std::string& path);
+    void refreshImageSummary();
+    /// 找下一张待下载的图片并开始下载；没有则返回 false
+    bool startNextPendingImage();
 
     void setButtonsEnabled(bool enabled);
     void setCancelEnabled(bool enabled);
@@ -105,12 +125,22 @@ class MainView : public brls::List
     InputRow* updateRow   = nullptr;
     InputRow* downloadRow = nullptr;
 
-    brls::Label* statusLabel           = nullptr;
-    brls::ProgressDisplay* bar         = nullptr;
-    brls::Button* cancelButton         = nullptr;
-    brls::Label* detailLabel           = nullptr;
-    brls::Label* dirLabel              = nullptr;
-    brls::RepeatingTask* pollTask      = nullptr;
+    brls::Label* statusLabel        = nullptr;
+    brls::ProgressDisplay* bar      = nullptr;
+    brls::Button* cancelButton      = nullptr;
+    brls::Label* detailLabel        = nullptr;
+    brls::Label* imageLabel         = nullptr;
+    brls::Label* dirLabel           = nullptr;
+    brls::Button* detailsButton     = nullptr;
+    brls::RepeatingTask* pollTask   = nullptr;
+
+    std::vector<ImageSlot> imageSlots;
+    /// 正在下载的图片下标（-1 = 没有）
+    int imageLoadingIndex = -1;
+    /// 启动流程是否已经跑过
+    bool startupImagesStarted = false;
+    int imagesLoaded = 0;
+    int imagesFailed = 0;
 
     /// 下载保存目录，默认 SD 卡根目录
     std::string outputDir = "sdmc:/";
@@ -128,6 +158,6 @@ class MainView : public brls::List
     int shownPercent = -1;
 
     /// 心跳用的计数（轮询是 100ms 一次，10 次 ≈ 1 秒）
-    int pollCount        = 0;
-    int lastHeartbeatAt  = 0;
+    int pollCount       = 0;
+    int lastHeartbeatAt = 0;
 };

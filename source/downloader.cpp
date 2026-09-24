@@ -179,7 +179,16 @@ size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
 
         std::string target = fsx::join(ctx->prog->destDir, name);
 
-        if (!fsx::createAndOpenFile(target, &ctx->file))
+        // 期望长度（xferInfoCallback 从 Content-Length 拿到的，存在 prog->total）能预先
+        // 知道时，直接让 fsx 把文件长度定好：后续写入都落在长度之内，就不会触发 FS 的
+        // 「隐式扩大文件」检查（缺 Append 位时那个检查会返回 0x00307202）。
+        // 上限 256MB —— 再大就让 Append 位随写随扩，免得建文件时长时间阻塞。
+        const long long hintTotal = ctx->prog->total.load();
+        const s64 prealloc        = (hintTotal > 0 && hintTotal <= 256LL * 1024 * 1024)
+                                        ? static_cast<s64>(hintTotal)
+                                        : 0;
+
+        if (!fsx::createAndOpenFile(target, &ctx->file, prealloc))
         {
             ctx->writeError = true;
             setError(ctx->prog, "无法在目标目录创建文件：" + target);
@@ -345,12 +354,18 @@ bool Downloader::start(const std::string& url, const std::string& destDirectory)
     return this->startInternal(url, destDirectory, Mode::ToFile);
 }
 
+bool Downloader::startAs(const std::string& url, const std::string& destDirectory, const std::string& fileName)
+{
+    return this->startInternal(url, destDirectory, Mode::ToFile, fileName);
+}
+
 bool Downloader::startFetchText(const std::string& url)
 {
     return this->startInternal(url, "", Mode::ToMemory);
 }
 
-bool Downloader::startInternal(const std::string& url, const std::string& destDirectory, Mode mode)
+bool Downloader::startInternal(const std::string& url, const std::string& destDirectory, Mode mode,
+    const std::string& forcedFileName)
 {
     // 上一轮线程理论上已经结束，这里只是兜底
     this->join();
@@ -362,10 +377,11 @@ bool Downloader::startInternal(const std::string& url, const std::string& destDi
     if (mode == Mode::ToFile && !fsx::ensureDirectory(destDirectory))
         return false;
 
-    auto prog     = std::make_shared<Progress>();
-    prog->mode    = mode;
-    prog->url     = trim(url);
-    prog->destDir = fsx::normalize(destDirectory);
+    auto prog            = std::make_shared<Progress>();
+    prog->mode           = mode;
+    prog->url            = trim(url);
+    prog->destDir        = fsx::normalize(destDirectory);
+    prog->forcedFileName = forcedFileName;
 
     this->progress = prog;
 

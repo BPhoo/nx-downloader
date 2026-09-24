@@ -187,7 +187,7 @@ bool ensureDirectory(const std::string& sdmcPath)
     return isDirectory(full);
 }
 
-bool createAndOpenFile(const std::string& sdmcPath, FsFile* out)
+bool createAndOpenFile(const std::string& sdmcPath, FsFile* out, s64 preallocSize)
 {
     std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
 
@@ -203,11 +203,32 @@ bool createAndOpenFile(const std::string& sdmcPath, FsFile* out)
             return false;
     }
 
-    Result rc = fsFsCreateFile(&g_sd, path.c_str(), 0, 0);
+    // 预先把文件长度定下来（能给就给）。
+    // 好处：后续 fsFileWrite 全在长度之内，根本不会触发「隐式扩大文件」那条路，
+    // 同时也少了一堆簇分配的抖动。预分配失败就退回 0 字节，由 Append 位兜底。
+    Result rc = 0;
+    if (preallocSize > 0)
+        rc = fsFsCreateFile(&g_sd, path.c_str(), preallocSize, 0);
+    else
+        rc = fsFsCreateFile(&g_sd, path.c_str(), 0, 0);
+
+    if (R_FAILED(rc))
+        rc = fsFsCreateFile(&g_sd, path.c_str(), 0, 0);
+
     if (R_FAILED(rc))
         return false;
 
-    rc = fsFsOpenFile(&g_sd, path.c_str(), FsOpenMode_Write, out);
+    // ★★ 必须带 FsOpenMode_Append —— 这不是「只能追加」，而是 Nintendo FS 的
+    //    **OpenMode_AllowAppend**：允许 WriteFile 隐式扩大文件长度。
+    //    官方错误码表原文：
+    //      0x307202  6201  "OpenMode_AllowAppend is required for implicit
+    //                        extension of file size by WriteFile()."
+    //    真机实测就是踩在这里：只开 FsOpenMode_Write 时，往新文件里写数据被拒，
+    //    下载直接报「写入 SD 卡失败（0x00307202）」。
+    //    libnx 自己的 fsdev 也是这么开的：
+    //      case O_WRONLY: fsdev_flags |= FsOpenMode_Write | FsOpenMode_Append;
+    //    写入偏移仍然按我们传的 offset 走，不是强制追加到末尾。
+    rc = fsFsOpenFile(&g_sd, path.c_str(), FsOpenMode_Write | FsOpenMode_Append, out);
     if (R_FAILED(rc))
     {
         fsFsDeleteFile(&g_sd, path.c_str());
@@ -422,7 +443,9 @@ bool writeWholeFile(const std::string& sdmcPath, const std::string& data)
     }
 
     FsFile file = {};
-    if (R_FAILED(fsFsOpenFile(&g_sd, path.c_str(), FsOpenMode_Write, &file)))
+    // 同 createAndOpenFile：必须带 Append（= AllowAppend，允许写入扩大文件长度），
+    // 否则往新建的空文件里写内容会被 FS 拒绝（0x00307202 / 6201）。
+    if (R_FAILED(fsFsOpenFile(&g_sd, path.c_str(), FsOpenMode_Write | FsOpenMode_Append, &file)))
         return false;
 
     Result rc = fsFileWrite(&file, 0, data.data(), data.size(), FsWriteOption_Flush);

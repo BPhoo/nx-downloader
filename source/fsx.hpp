@@ -37,8 +37,14 @@ bool createDirectory(const std::string& sdmcPath);
 /// 递归创建目录，已存在则直接返回 true
 bool ensureDirectory(const std::string& sdmcPath);
 
-/// 创建并打开文件用于写入
-bool createAndOpenFile(const std::string& sdmcPath, FsFile* out);
+/// 创建并打开文件用于写入。
+///
+/// preallocSize：期望的文件总长度（能预先知道就给），>0 时会先把文件长度
+/// 定到这个值，后续写入都在长度之内 —— 这样就不会走「隐式扩大文件」那条路。
+/// ★ 内部固定用 `FsOpenMode_Write | FsOpenMode_Append`：
+///   Nintendo 的 FS 把 Append 位解释为 **AllowAppend**（允许 WriteFile 隐式扩大文件），
+///   缺了它会返回 0x00307202（6201）。
+bool createAndOpenFile(const std::string& sdmcPath, FsFile* out, s64 preallocSize = 0);
 
 //----------------------------------------------------------------------
 // ⚠️ 为什么写入要单独走这两个接口：

@@ -13,6 +13,7 @@ const char* SETTINGS_FILE   = "sdmc:/switch/nx-downloader/settings.txt";
 const char* CA_BUNDLE       = "sdmc:/switch/nx-downloader/cacert.pem";
 const char* LOG_FILE        = "sdmc:/switch/nx-downloader/log.txt";
 const char* RESULT_FILE     = "sdmc:/switch/nx-downloader/update_result.txt";
+const char* IMG_DIR         = "sdmc:/switch/nx-downloader/img";
 const char* DEFAULT_OUT_DIR = "sdmc:/";
 
 namespace
@@ -155,18 +156,138 @@ bool extractValue(const std::string& text, const std::string& key, std::string* 
     }
 }
 
+/// 按逗号拆成多项（英文 , 与中文 ，都认），去掉空白项
+std::vector<std::string> splitCommas(const std::string& raw)
+{
+    std::vector<std::string> out;
+    std::string current;
+
+    for (size_t i = 0; i < raw.size(); i++)
+    {
+        // 中文逗号 "，" 是 3 字节 UTF-8: EF BC 8C
+        const bool cnComma = (i + 2 < raw.size() &&
+                              static_cast<unsigned char>(raw[i]) == 0xEF &&
+                              static_cast<unsigned char>(raw[i + 1]) == 0xBC &&
+                              static_cast<unsigned char>(raw[i + 2]) == 0x8C);
+
+        if (raw[i] == ',' || cnComma)
+        {
+            const std::string item = trim(current);
+            if (!item.empty())
+                out.push_back(item);
+            current.clear();
+
+            if (cnComma)
+                i += 2;
+            continue;
+        }
+
+        current.push_back(raw[i]);
+    }
+
+    const std::string last = trim(current);
+    if (!last.empty())
+        out.push_back(last);
+
+    return out;
+}
+
+/// 读「列表型」的值：一直读到 } 或行尾，再按逗号拆开。
+/// 用在 url.txt 的 `img: a.jpg, b.jpg, c.jpg` 这种写法上（普通标量值用 extractValue）。
+bool extractList(const std::string& text, const std::string& key, std::vector<std::string>* out)
+{
+    const std::string lower = toLower(text);
+    size_t pos              = 0;
+    bool found              = false;
+
+    while (true)
+    {
+        pos = lower.find(key, pos);
+        if (pos == std::string::npos)
+            break;
+
+        const bool leftOk  = (pos == 0) || !std::isalnum(static_cast<unsigned char>(lower[pos - 1]));
+        const size_t after = pos + key.size();
+        const bool rightOk = (after >= lower.size()) || !std::isalnum(static_cast<unsigned char>(lower[after]));
+
+        if (!leftOk || !rightOk)
+        {
+            pos = after;
+            continue;
+        }
+
+        size_t i = after;
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n'))
+            i++;
+
+        if (i < text.size() && (text[i] == ':' || text[i] == '='))
+        {
+            i++;
+            while (i < text.size() && (text[i] == ' ' || text[i] == '\t'))
+                i++;
+        }
+
+        // 读到 } 或换行；引号内的内容原样保留（引号里允许逗号）
+        std::string raw;
+        bool inQuote = false;
+        char quote   = 0;
+
+        for (; i < text.size(); i++)
+        {
+            const char c = text[i];
+
+            if (inQuote)
+            {
+                if (c == quote)
+                {
+                    inQuote = false;
+                    continue;
+                }
+                raw.push_back(c);
+                continue;
+            }
+
+            if (c == '"' || c == '\'')
+            {
+                inQuote = true;
+                quote   = c;
+                continue;
+            }
+
+            if (c == '}' || c == '\n' || c == '\r')
+                break;
+
+            raw.push_back(c);
+        }
+
+        const std::vector<std::string> items = splitCommas(raw);
+        if (!items.empty())
+        {
+            out->insert(out->end(), items.begin(), items.end());
+            found = true;
+        }
+
+        pos = after;
+    }
+
+    return found;
+}
+
 } // namespace
 
 std::string urlFileTemplate()
 {
     std::string text;
     text += "// NX Downloader 配置文件（直接用文本编辑器改就行，改完重启程序生效）\n";
-    text += "// 第一项：检查更新用的链接，对应界面第一行的「访问」\n";
-    text += "// 第二项：下载文件用的链接，对应界面第二行的「访问」\n";
+    text += "// updata  ：检查更新用的链接，对应界面第一行的「访问」\n";
+    text += "// download：下载文件用的链接，对应界面第二行的「访问」\n";
+    text += "// img     ：要显示的图片，逗号分隔。可以写 http(s) 链接（程序会自动下载并缓存到\n";
+    text += "//           img/ 目录），也可以写已经放在 SD 卡上的文件名\n";
     text += "// 链接可以省略 https:// ，程序会自动补上\n";
     text += "{\n";
     text += "    updata:   https://example.com/version.txt ,\n";
-    text += "    download: https://example.com/app.nro\n";
+    text += "    download: https://example.com/app.nro ,\n";
+    text += "    img:      https://example.com/a.jpg, https://example.com/b.jpg\n";
     text += "}\n";
     return text;
 }
@@ -192,7 +313,33 @@ bool parseUrlFile(const std::string& text, UrlEntry* out)
         any           = true;
     }
 
+    // img: 是「列表值」（可以写多个），而且**刻意不做 normalizeUrl**：
+    // 它也可能是本地文件名而不是链接，硬加 https:// 反而会把它弄坏。
+    {
+        std::vector<std::string> images;
+        extractList(clean, "img", &images);
+        extractList(clean, "image", &images);
+        extractList(clean, "images", &images);
+
+        if (!images.empty())
+        {
+            out->images = images;
+            any         = true;
+        }
+    }
+
     return any;
+}
+
+std::string imageFileName(size_t index, const std::string& item)
+{
+    std::string name = fsx::fileNameFromUrl(item);
+    if (name.empty())
+        name = "image.jpg";
+
+    // 序号前缀：不同图片重名也不会互相覆盖；改了 url.txt 的顺序/内容后
+    // 文件名随之变化，也就不会读到上一次的旧缓存。
+    return std::to_string(static_cast<unsigned>(index + 1)) + "-" + name;
 }
 
 bool readUrlFile(UrlEntry* out, std::string* errorText)

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace appcfg
 {
@@ -29,6 +30,8 @@ extern const char* CA_BUNDLE; // "sdmc:/switch/nx-downloader/cacert.pem"
 extern const char* LOG_FILE; // "sdmc:/switch/nx-downloader/log.txt"
 /// 检查更新的返回内容（每次检查后覆盖写入，方便离线查看，也是个兜底）
 extern const char* RESULT_FILE; // "sdmc:/switch/nx-downloader/update_result.txt"
+/// 网络图片缓存目录（url.txt 里 img: 的图片下载到这里）
+extern const char* IMG_DIR; // "sdmc:/switch/nx-downloader/img"
 /// 默认下载目录：SD 卡根目录
 extern const char* DEFAULT_OUT_DIR; // "sdmc:/"
 
@@ -36,7 +39,14 @@ struct UrlEntry
 {
     std::string update;   // url.txt 里的 updata
     std::string download; // url.txt 里的 download
+    /// url.txt 里的 img:（逗号分隔，项可以是 http(s) 链接，也可以是本地文件名）
+    std::vector<std::string> images;
 };
+
+/// 图片缓存的落盘文件名：`<序号>-<原名>`，序号从 1 开始。
+/// 带上序号是为了：① 不同图片即使重名也不会互相覆盖；② 改动 url.txt 里的顺序/内容后，
+/// 文件名随之改变，不会读到上一次的旧缓存。
+std::string imageFileName(size_t index, const std::string& item);
 
 /// 启动时调用：确保项目文件夹存在；没有 url.txt 就写入模板
 /// createdDir / createdFile 用来告诉调用方「这次新建了什么」（可为 nullptr）

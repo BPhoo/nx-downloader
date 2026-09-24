@@ -35,6 +35,15 @@ constexpr unsigned MIN_INPUT_WIDTH = 200;
 /// 详情区最多显示多少字节（完整内容会另存到 RESULT_FILE，不会丢）
 constexpr size_t MAX_RESULT_DISPLAY = 2000;
 
+/// 最多加载几张图片（每张都要占显存，别放任用户写一长串）
+constexpr size_t MAX_IMAGES = 6;
+
+/// 图片显示高度（宽度由 List 给，按 FIT 缩放居中）
+constexpr unsigned IMAGE_VIEW_HEIGHT = 300;
+
+/// 诊断页里最多显示多少字节的返回内容
+constexpr size_t MAX_DETAIL_BYTES = 6000;
+
 unsigned listItemHeight()
 {
     Style* style = Application::getStyle();
@@ -62,13 +71,7 @@ std::string stripLineBreaks(const std::string& s)
     return out;
 }
 
-/// 按「字符数」粗略截断（UTF-8 安全）。
-///
-/// 为什么不用 nanovg 的 nvgTextBounds 精确测量：
-///   v2.0.0 是在 draw() 里每帧调用 nvgTextBounds 做二分截断的。
-///   那会在绘制过程中反复触发 fontstash 的字形查找/图集刷新，
-///   在 Applet 模式下是不必要的风险。这里改成在 setText() 时按字符数
-///   预先截断好，draw() 只做一次 nvgText，零测量、零分配。
+/// 按「字符数」粗略截断（UTF-8 安全）
 std::string truncateChars(const std::string& text, size_t maxChars)
 {
     if (text.empty() || maxChars == 0)
@@ -79,7 +82,6 @@ std::string truncateChars(const std::string& text, size_t maxChars)
 
     while (index < text.size())
     {
-        // 前进一个完整的 UTF-8 码点
         index++;
         while (index < text.size() && (static_cast<unsigned char>(text[index]) & 0xC0) == 0x80)
             index++;
@@ -108,6 +110,19 @@ std::string capText(const std::string& text, size_t maxBytes)
     return text.substr(0, cut) + "\n\n…（内容过长，完整内容见 " + std::string(appcfg::RESULT_FILE) + "）";
 }
 
+/// url / 本地路径 的简单判定
+bool looksLikeUrl(const std::string& s)
+{
+    const std::string lower = [&s] {
+        std::string t = s;
+        for (char& c : t)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return t;
+    }();
+
+    return lower.compare(0, 7, "http://") == 0 || lower.compare(0, 8, "https://") == 0;
+}
+
 } // namespace
 
 //=====================================================================
@@ -118,12 +133,7 @@ std::string capText(const std::string& text, size_t maxBytes)
 // 匿名命名空间里的同名类是完全不同的类型，会编译不过。
 //=====================================================================
 
-/// 一行里的链接输入框。
-///
-/// 为什么不用 ListItem 自带的 value：value 是右对齐绘制的，链接动辄上百字符，
-/// 右对齐会让文字一路向左溢出、盖住左边的标题。这里整段自绘：
-///   * 左边一个标题
-///   * 右边一个圆角框，内容是左对齐、超长截断的链接文本
+/// 一行里的链接输入框（继承 ListItem 整段自绘：左标题 + 右圆角框内左对齐文本）
 class UrlInputItem : public ListItem
 {
   public:
@@ -137,8 +147,8 @@ class UrlInputItem : public ListItem
     /// 内容被改动时回调（用来把设置落盘）
     std::function<void()> onChange;
 
-    /// 需要提示用户时回调（MainView 会把它接到状态栏/详情区）。
-    /// 刻意不用 Application::notify：通知同样是「多一个动画 + 多一个额外视图」，
+    /// 需要提示用户时回调（由 MainView 接到状态栏/详情区）。
+    /// 刻意不用 Application::notify：通知是「多一个动画 + 多一个额外视图」，
     /// 而本版本的目标就是把界面上的动画/视图栈操作减到最少。
     std::function<void(const std::string&)> onNotice;
 
@@ -148,7 +158,6 @@ class UrlInputItem : public ListItem
         // ⚠️ Applet 模式（从相册启动）下**不要**调系统键盘。
         //    libnx 的 swkbd 本质是「再起一个 applet」，在 applet 环境里
         //    既可能直接失败，也可能把界面卡住（真机实测过「按 A 就死机」）。
-        //    真要用键盘，必须按住 R 键从游戏图标启动（完整内存模式）。
         //--------------------------------------------------------------
         if (appletGetAppletType() != AppletType_Application)
         {
@@ -170,16 +179,6 @@ class UrlInputItem : public ListItem
             this->notify("系统键盘没能打开：可按 X 或点文件图标从 url.txt 读取");
 
         return true;
-    }
-
-    /// 有提示就转给 MainView；万一没接回调，退回 borealis 的通知
-    /// （宁可多一个通知，也不能把提示静默吞掉）
-    void notify(const std::string& text)
-    {
-        if (this->onNotice)
-            this->onNotice(text);
-        else
-            Application::notify(text);
     }
 
     void setText(const std::string& value)
@@ -214,8 +213,7 @@ class UrlInputItem : public ListItem
         unsigned labelWidth = this->cachedLabelWidth;
         if (!this->label.empty())
         {
-            // 标题宽度只测一次（两个输入框就是两次 nvgTextBounds，之后一直复用）。
-            // v2.0.0 是每帧都测，还会为截断反复测 —— 那属于没必要的风险。
+            // 标题宽度只测一次（两个输入框就是两次 nvgTextBounds，之后一直复用）
             if (labelWidth == 0)
             {
                 float bounds[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -256,8 +254,7 @@ class UrlInputItem : public ListItem
         nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
         nvgFillColor(vg, empty ? ctx->theme->descriptionColor : ctx->theme->listItemValueColor);
 
-        // 用 scissor 把文本裁在输入框内：不需要任何文字测量，
-        // 超长链接也只会被干净地切掉，不会溢出到图标/按钮上。
+        // 用 scissor 把文本裁在输入框内：不需要任何文字测量
         nvgSave(vg);
         nvgScissor(vg,
             static_cast<float>(boxLeft + textLeft),
@@ -276,10 +273,16 @@ class UrlInputItem : public ListItem
   private:
     std::string url;
     std::string placeholder;
-    /// 已按字符数截断的显示文本（draw 直接用）
     std::string display;
-    /// 标题宽度缓存（首次绘制时测一次）
     unsigned cachedLabelWidth = 0;
+
+    void notify(const std::string& text)
+    {
+        if (this->onNotice)
+            this->onNotice(text);
+        else
+            Application::notify(text);
+    }
 };
 
 //=====================================================================
@@ -289,17 +292,14 @@ class UrlInputItem : public ListItem
 class InputRow : public BoxLayout
 {
   public:
-    /// withFolderButton：只有「下载」行才需要选保存目录的图标
     InputRow(const std::string& labelText, const std::string& placeholder, bool withFolderButton)
         : BoxLayout(BoxLayoutOrientation::HORIZONTAL)
     {
         const unsigned h = listItemHeight();
 
         this->setHeight(h);
-        // 行高 / 6 ≈ 11，兜底不小于 8，别出现 0 间距
         this->setSpacing(h / 6 > 8 ? h / 6 : 8);
 
-        // 顺序就是左右顺序。输入框排最前，宽度在 layout() 里根据剩余空间算。
         this->input = new UrlInputItem(labelText, placeholder);
         this->addView(this->input);
 
@@ -321,18 +321,12 @@ class InputRow : public BoxLayout
 
     void layout(NVGcontext* vg, Style* style, FontStash* stash) override
     {
-        // 用 getHeight(false) 拿「原始高度」，不要用 getHeight()：
-        // 后者会乘上 collapseState（滚动出屏时会动画到 0），
-        // 高度为 0 时子视图宽度会被算成 0，白白多出一堆边界情况。
         unsigned h = this->getHeight(false);
-
-        // 兜底：万一高度还没被父级设好（或异常为 0），退回样式表里的行高
         if (h < 20)
             h = listItemHeight();
 
         const unsigned gap = static_cast<unsigned>(this->getSpacing());
 
-        // 图标按钮做成正方形，访问按钮稍宽（按行高成比例，跟着系统 UI 缩放走）
         const unsigned iconWidth = h;
         const unsigned goWidth   = h * 2;
 
@@ -344,8 +338,7 @@ class InputRow : public BoxLayout
         const unsigned total      = this->getWidth();
         const unsigned inputWidth = (total > fixed + MIN_INPUT_WIDTH) ? (total - fixed) : MIN_INPUT_WIDTH;
 
-        // BoxLayout 的水平布局用的是各子视图「已存」的宽度，
-        // 所以必须在调基类之前把宽度都定下来。
+        // BoxLayout 的水平布局用的是各子视图「已存」的宽度，必须在调基类前定好
         this->input->setWidth(inputWidth);
         this->fileButton->setWidth(iconWidth);
         if (this->folderButton != nullptr)
@@ -365,10 +358,96 @@ namespace
 {
 
 //=====================================================================
-// 轮询任务：把工作线程的状态搬到界面上
+// 取消按钮
 //
-// 它只做一件事：调用 view->onPoll()。
-// onPoll() 内部只会改 Label 文本 —— 不碰视图栈、不弹窗、不发通知。
+// borealis 判定「某视图能不能被聚焦」的唯一依据是 `getDefaultFocus()` 是否返回非空，
+// 所以这里就复用它：**只有任务进行中才允许被聚焦**。
+// 另外它在 List 里没人会给高度，不给就会只剩一条横线（真机截图就是这样）。
+//=====================================================================
+class CancelButton : public Button
+{
+  public:
+    CancelButton()
+        : Button(ButtonStyle::REGULAR)
+    {
+        this->setLabel("取消当前任务");
+
+        Style* style = Application::getStyle();
+        if (style != nullptr)
+            this->setHeight(style->List.Item.height);
+    }
+
+    View* getDefaultFocus() override
+    {
+        return this->active ? this : nullptr;
+    }
+
+    /// true：有任务，显示且可聚焦；false：完全收起（不留「可以选中的横线」）
+    void setActive(bool value)
+    {
+        this->active = value;
+        this->setState(value ? ButtonState::ENABLED : ButtonState::DISABLED);
+
+        // 用**非动画**的收起/展开：这里不需要过渡效果，也少一份动画风险
+        if (value)
+            this->expand(false);
+        else
+            this->collapse(false);
+    }
+
+  private:
+    bool active = false;
+};
+
+//=====================================================================
+// 诊断信息页（按键触发才 pushView，属于允许的常规路径）
+//=====================================================================
+class DetailsView : public List
+{
+  public:
+    DetailsView(const std::string& imageSummary, const std::string& imageDetail)
+        : List()
+    {
+        this->registerAction("返回", Key::B, [] {
+            Application::popView();
+            return true;
+        });
+
+        this->addView(new Header("诊断信息与提示", true, "按 B 返回"));
+
+        this->addView(new Label(LabelStyle::DESCRIPTION,
+            "操作：A 输入链接 · X 读取 url.txt · 文件图标选 .txt · 文件夹图标选保存目录 · "
+            "十字键/左摇杆 移动 · + 退出\n"
+            "下载会覆盖同名文件；进度、结果与错误都显示在主页面里，不再弹窗。",
+            true));
+
+        this->addView(new Label(LabelStyle::DESCRIPTION,
+            "运行环境：" + netx::describe() + "\n"
+            "日志文件：" + std::string(appcfg::LOG_FILE) + "\n"
+            "项目目录：" + std::string(appcfg::PROJECT_DIR) + "\n"
+            "图片缓存：" + std::string(appcfg::IMG_DIR),
+            true));
+
+        this->addView(new Label(LabelStyle::DESCRIPTION, imageSummary + "\n" + imageDetail, true));
+
+        // 上次检查更新的完整返回内容
+        std::string result;
+        if (fsx::readWholeFile(appcfg::RESULT_FILE, &result) && !result.empty())
+        {
+            this->addView(new Label(LabelStyle::DESCRIPTION,
+                "上次检查更新的完整返回内容（" + fsx::formatBytes(static_cast<s64>(result.size())) + "）：", true));
+            this->addView(new Label(LabelStyle::DESCRIPTION, capText(result, MAX_DETAIL_BYTES), true));
+        }
+        else
+        {
+            this->addView(new Label(LabelStyle::DESCRIPTION,
+                "还没有检查更新的记录（在主页面第一行点「访问」试一次）。", true));
+        }
+    }
+};
+
+//=====================================================================
+// 轮询任务：把工作线程的状态搬到界面上
 //=====================================================================
 class PollTask : public RepeatingTask
 {
@@ -388,8 +467,7 @@ class PollTask : public RepeatingTask
     void run(retro_time_t currentTime) override
     {
         // ★ 必须调用基类实现：`lastRun = currentTime` 就在里面。
-        //   不调用它，lastRun 恒为 0，下面的节流条件恒成立，
-        //   任务会退化成「每帧都跑」（60 次/秒）。
+        //   不调用它，lastRun 恒为 0，节流条件恒成立，任务会退化成每帧都跑。
         RepeatingTask::run(currentTime);
 
         if (this->view != nullptr)
@@ -410,7 +488,6 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     : List()
     , downloader(downloader)
 {
-    // 控件还没建，先从 settings.txt 把上次的值取出来暂存
     this->readSettings();
 
     if (!this->savedDir.empty())
@@ -419,79 +496,28 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     this->addView(new Header("NX Downloader", true, "上行检查更新 · 下行下载文件"));
 
     this->buildRows();
-
-    //------------------------- 状态区 -------------------------//
-    // 全部做成常驻控件：任何时候都只是改文本，不增删视图、不弹窗。
-    this->statusLabel = new Label(LabelStyle::REGULAR, "状态：就绪", false);
-    this->shownStatus = "就绪";
-    this->addView(this->statusLabel);
-
-    this->bar = new ProgressDisplay(ProgressDisplayFlags::PERCENTAGE);
-    this->bar->setHeight(60);
-    this->addView(this->bar);
-
-    this->cancelButton = new Button(ButtonStyle::REGULAR);
-    this->cancelButton->setLabel("取消当前任务");
-    this->cancelButton->setState(ButtonState::DISABLED);
-    this->cancelButton->getClickEvent()->subscribe([this](View*) {
-        if (this->downloader == nullptr)
-            return;
-
-        logx::ui("用户点了「取消当前任务」");
-        this->downloader->requestCancel();
-        this->setStatus("正在取消…");
-    });
-    this->addView(this->cancelButton);
-
-    //------------------------- 详情区 -------------------------//
-    const std::string detailText = startupNotice.empty()
-        ? "（这里会显示检查更新的返回内容、以及错误详情）"
-        : startupNotice;
-
-    this->detailLabel = new Label(LabelStyle::DESCRIPTION, detailText, true);
-    this->shownDetail  = detailText;
-    this->addView(this->detailLabel);
-
-    this->dirLabel = new Label(LabelStyle::DESCRIPTION,
-        "下载保存到：" + this->outputDir + "（第二行的文件夹图标可更换）", true);
-    this->addView(this->dirLabel);
-
-    Label* tip = new Label(LabelStyle::DESCRIPTION,
-        "A 输入链接（最长 100 字符）· X 读取 " + std::string(appcfg::URL_FILE) +
-            " 里对应的值 · 文件图标可挑选任意 .txt\n"
-            "同名文件会被直接覆盖；进度、结果与错误都显示在本页，不再弹窗。",
-        true);
-    this->addView(tip);
-
-    // 运行环境诊断行：出问题时这一行就能看出是哪一环不对，
-    // 细节（含 libnx 的 Result 错误码）在 log.txt 里。
-    Label* diag = new Label(LabelStyle::DESCRIPTION,
-        "环境：" + netx::describe() + "\n日志：" + std::string(appcfg::LOG_FILE), true);
-    this->addView(diag);
+    this->buildStatusArea();
+    this->buildGallery();
+    this->buildFooter(startupNotice);
 
     this->setButtonsEnabled(true);
     this->setCancelEnabled(false);
 
-    // 控件都建好之后再回填上次保存的内容
     if (!this->savedUpdate.empty())
         this->updateRow->input->setText(appcfg::normalizeUrl(this->savedUpdate));
     if (!this->savedDownload.empty())
         this->downloadRow->input->setText(appcfg::normalizeUrl(this->savedDownload));
 
-    //------------------------- 轮询任务 -------------------------//
-    // 常驻：空闲时 onPoll() 会在第一行直接返回，代价只是每 100ms 读几个原子量。
-    // 这样做是为了彻底避免「任务对象的创建/回收」这类生命周期问题。
+    // 轮询任务常驻：空闲时 onPoll() 第一行就返回，代价只是每 100ms 读几个原子量
     PollTask* poll = new PollTask(this);
     poll->start();
     this->pollTask = poll;
 
-    logx::ui("主界面已创建");
+    logx::uif("主界面已创建（图片位 %u 个）", static_cast<unsigned>(this->imageSlots.size()));
 }
 
 MainView::~MainView()
 {
-    // 轮询任务常驻在任务管理器里，必须先断开它对 this 的引用，
-    // 否则本对象销毁之后任务再被调度一次就会访问已释放内存。
     if (this->pollTask != nullptr)
     {
         static_cast<PollTask*>(this->pollTask)->detach();
@@ -504,20 +530,16 @@ MainView::~MainView()
 
 void MainView::buildRows()
 {
-    //=========================== 第一行：检查更新 ===========================//
     this->updateRow = new InputRow("更新链接", "按 A 输入检查更新的链接（可留空）", false);
     this->addView(this->updateRow);
 
-    //=========================== 第二行：下载文件 ===========================//
     this->downloadRow = new InputRow("下载链接", "按 A 输入要下载的文件直链", true);
     this->addView(this->downloadRow);
 
-    // 每行的输入框改动后都落盘
     const auto saveHook = [this] { this->saveSettings(); };
     this->updateRow->input->onChange   = saveHook;
     this->downloadRow->input->onChange = saveHook;
 
-    // 输入框自己产生的提示（例如「Applet 模式不能用系统键盘」）统一转到这里显示
     const auto noticeHook = [this](const std::string& text) {
         this->setStatus(text);
         this->setDetail(text);
@@ -525,7 +547,7 @@ void MainView::buildRows()
     this->updateRow->input->onNotice   = noticeHook;
     this->downloadRow->input->onNotice = noticeHook;
 
-    // X 键绑定在「行」上：焦点在该行的任意控件（输入框 / 图标 / 访问按钮）时都生效
+    // X 键绑在「行」上：焦点在该行任意控件时都生效
     this->updateRow->registerAction("读 url.txt", Key::X, [this] {
         this->loadFromProjectUrlFile(true);
         return true;
@@ -557,12 +579,105 @@ void MainView::buildRows()
     });
 }
 
+void MainView::buildStatusArea()
+{
+    this->statusLabel = new Label(LabelStyle::REGULAR, "状态：就绪", false);
+    this->shownStatus = "就绪";
+    this->addView(this->statusLabel);
+
+    this->bar = new ProgressDisplay(ProgressDisplayFlags::PERCENTAGE);
+    this->bar->setHeight(60);
+    this->addView(this->bar);
+
+    CancelButton* cancel = new CancelButton();
+    cancel->getClickEvent()->subscribe([this](View*) {
+        if (this->downloader == nullptr)
+            return;
+
+        logx::ui("用户点了「取消当前任务」");
+        this->downloader->requestCancel();
+        this->setStatus("正在取消…");
+    });
+    cancel->setActive(false);
+    this->cancelButton = cancel;
+    this->addView(cancel);
+
+    this->detailLabel = new Label(LabelStyle::DESCRIPTION,
+        "（这里会显示检查更新的返回内容、以及错误详情）", true);
+    this->shownDetail = "（这里会显示检查更新的返回内容、以及错误详情）";
+    this->addView(this->detailLabel);
+}
+
+void MainView::buildGallery()
+{
+    // 从 url.txt 里取 img: 列表
+    std::vector<std::string> items;
+
+    std::string urlText;
+    if (fsx::readWholeFile(appcfg::URL_FILE, &urlText))
+    {
+        appcfg::UrlEntry entry;
+        appcfg::parseUrlFile(urlText, &entry);
+        items = entry.images;
+    }
+
+    if (items.size() > MAX_IMAGES)
+    {
+        logx::uif("img: 配置了 %u 项，只加载前 %u 张（显存有限）",
+            static_cast<unsigned>(items.size()), static_cast<unsigned>(MAX_IMAGES));
+        items.resize(MAX_IMAGES);
+    }
+
+    this->imageLabel = new Label(LabelStyle::DESCRIPTION,
+        items.empty() ? "图片：未配置（在 url.txt 里用 img: 指定，逗号分隔）" : "图片：准备中…", true);
+    this->addView(this->imageLabel);
+
+    for (size_t i = 0; i < items.size(); i++)
+    {
+        ImageSlot slot;
+        slot.item = items[i];
+
+        slot.view = new Image();
+        slot.view->setHeight(IMAGE_VIEW_HEIGHT);
+        slot.view->setScaleType(ImageScaleType::FIT);
+        // 先收起：等图片真的加载出来再展开，避免失败时留下一大片空白
+        slot.view->collapse(false);
+
+        this->addView(slot.view);
+        this->imageSlots.push_back(slot);
+    }
+
+    if (!items.empty())
+        logx::uif("img: 共 %u 项", static_cast<unsigned>(items.size()));
+}
+
+void MainView::buildFooter(const std::string& startupNotice)
+{
+    this->dirLabel = new Label(LabelStyle::DESCRIPTION,
+        "下载保存到：" + this->outputDir + "（第二行的文件夹图标可更换）", true);
+    this->addView(this->dirLabel);
+
+    if (!startupNotice.empty())
+        this->addView(new Label(LabelStyle::DESCRIPTION, startupNotice, true));
+
+    //-----------------------------------------------------------------
+    // ★ 底部锚点：borealis 的 List 只会「滚动到当前焦点」，页面最底下如果
+    //   没有可聚焦的控件，再往下就永远滚不动（实测就是「底部内容看不全」）。
+    //   这个按钮既是有用的入口，也顺手把滚动范围撑到底。
+    //-----------------------------------------------------------------
+    this->detailsButton = new Button(ButtonStyle::REGULAR);
+    this->detailsButton->setLabel("诊断信息与提示");
+    this->detailsButton->setHeight(listItemHeight());
+    this->detailsButton->getClickEvent()->subscribe([this](View*) {
+        this->openDetailsView();
+    });
+    this->addView(this->detailsButton);
+}
+
 //------------------------------ 只改文本的显示接口 ------------------------------//
 
 void MainView::setStatus(const std::string& text)
 {
-    // 内容没变就不碰控件：setText 会让父级（这个 List）置脏，
-    // 白白触发一次全量布局。
     if (this->shownStatus == text)
         return;
 
@@ -584,10 +699,8 @@ void MainView::setDetail(const std::string& text)
 
     this->detailLabel->setText(text);
 
-    // ⚠️ borealis 的 Label::setText 只把「父级」标脏，自己不会重新测量高度，
-    //    于是文本变长后高度不更新，会压到下面的控件上。
-    //    这里显式把自己也标脏：下一帧 List 排好宽度之后它会自己重算高度。
-    //    （注意只能用非立即模式：立即布局会在绘制阶段之外调用 nvg*）
+    // borealis 的 Label::setText 只把「父级」标脏，自己不重算高度 →
+    // 文本变长后会压到下面的控件上。这里把自己也标脏（只能用非立即模式）。
     this->detailLabel->invalidate(false);
 }
 
@@ -625,8 +738,13 @@ void MainView::setButtonsEnabled(bool enabled)
 
 void MainView::setCancelEnabled(bool enabled)
 {
-    if (this->cancelButton != nullptr)
-        this->cancelButton->setState(enabled ? ButtonState::ENABLED : ButtonState::DISABLED);
+    if (this->cancelButton == nullptr)
+        return;
+
+    static_cast<CancelButton*>(this->cancelButton)->setActive(enabled);
+
+    // 收起/展开改变了这一行占的高度，必须让 List 重新排版（invalidate 不会自动上溯）
+    this->invalidate();
 }
 
 void MainView::heartbeat()
@@ -644,15 +762,172 @@ void MainView::heartbeat()
         this->downloader != nullptr ? static_cast<long long>(this->downloader->downloaded()) : 0LL);
 }
 
+//------------------------------ 图片 ------------------------------//
+
+void MainView::loadImageIntoSlot(size_t index, const std::string& path)
+{
+    if (index >= this->imageSlots.size())
+        return;
+
+    ImageSlot& slot = this->imageSlots[index];
+
+    slot.cached = path;
+    slot.view->setImage(path);
+    slot.view->expand(false); // 展开成固定高度，交给 FIT 缩放
+
+    slot.loaded  = true;
+    slot.pending = false;
+
+    this->imagesLoaded++;
+
+    // ⚠️ borealis 的 `View::invalidate(bool)` **不会**往上通知父级
+    //    （它只置自己的 dirty）。展开/换图之后必须显式让 List 重新排版，
+    //    否则这一格仍然按 0 高度排位，图片会盖在下面的控件上。
+    this->invalidate();
+
+    logx::uif("图片 %u 已加载：%s", static_cast<unsigned>(index + 1), path.c_str());
+}
+
+void MainView::refreshImageSummary()
+{
+    if (this->imageLabel == nullptr)
+        return;
+
+    if (this->imageSlots.empty())
+    {
+        this->imageLabel->setText("图片：未配置（在 url.txt 里用 img: 指定，逗号分隔）");
+        return;
+    }
+
+    std::string text = "图片：" + std::to_string(this->imagesLoaded) + "/" +
+                       std::to_string(this->imageSlots.size()) + " 已加载";
+
+    if (this->imagesFailed > 0)
+        text += "，" + std::to_string(this->imagesFailed) + " 张失败";
+
+    if (this->task == Task::Images && this->imageLoadingIndex >= 0)
+        text += "（正在下载第 " + std::to_string(this->imageLoadingIndex + 1) + " 张）";
+
+    this->imageLabel->setText(text);
+    this->imageLabel->invalidate(false);
+}
+
+void MainView::startStartupImageLoad()
+{
+    this->startupImagesStarted = true;
+
+    if (this->imageSlots.empty())
+        return;
+
+    // 先把「本地已经有」的图片直接加载进来（不联网）
+    for (size_t i = 0; i < this->imageSlots.size(); i++)
+    {
+        ImageSlot& slot = this->imageSlots[i];
+
+        if (looksLikeUrl(slot.item))
+        {
+            // 有缓存就直接用：省一次下载，也让「启动即显示」成立
+            const std::string cached = fsx::join(appcfg::IMG_DIR, appcfg::imageFileName(i, slot.item));
+
+            if (fsx::exists(cached))
+                this->loadImageIntoSlot(i, cached);
+            else
+                slot.pending = true;
+
+            continue;
+        }
+
+        // 不是链接 → 当成本地文件名：先按原文，再按项目目录，最后按 SD 根目录找
+        std::string local = slot.item;
+
+        if (!fsx::exists(local))
+        {
+            const std::string inProject = fsx::join(appcfg::PROJECT_DIR, slot.item);
+            const std::string inRoot    = fsx::join("sdmc:/", slot.item);
+
+            if (fsx::exists(inProject))
+                local = inProject;
+            else if (fsx::exists(inRoot))
+                local = inRoot;
+            else
+                local.clear();
+        }
+
+        if (!local.empty())
+        {
+            this->loadImageIntoSlot(i, local);
+        }
+        else
+        {
+            logx::uif("图片 %u 找不到本地文件：%s", static_cast<unsigned>(i + 1), slot.item.c_str());
+            this->imagesFailed++;
+        }
+    }
+
+    this->refreshImageSummary();
+
+    // 再处理需要联网的（没有网络就跳过，别白等 15s 超时）
+    bool anyPending = false;
+    for (const ImageSlot& slot : this->imageSlots)
+        anyPending = anyPending || slot.pending;
+
+    if (!anyPending)
+        return;
+
+    if (!netx::ready() && !netx::init())
+    {
+        logx::ui("网络不可用：跳过图片下载");
+        this->imagesFailed += static_cast<int>(std::count_if(this->imageSlots.begin(), this->imageSlots.end(),
+            [](const ImageSlot& s) { return s.pending; }));
+        this->refreshImageSummary();
+        this->setDetail("网络不可用，图片没能下载（其它功能仍可使用）。");
+        return;
+    }
+
+    this->startNextPendingImage();
+}
+
+bool MainView::startNextPendingImage()
+{
+    for (size_t i = 0; i < this->imageSlots.size(); i++)
+    {
+        ImageSlot& slot = this->imageSlots[i];
+
+        if (!slot.pending || slot.loaded)
+            continue;
+
+        const std::string fileName = appcfg::imageFileName(i, slot.item);
+
+        if (!this->downloader->startAs(slot.item, appcfg::IMG_DIR, fileName))
+        {
+            logx::uif("图片 %u 无法开始下载：%s", static_cast<unsigned>(i + 1), slot.item.c_str());
+            slot.pending = false;
+            this->imagesFailed++;
+            continue;
+        }
+
+        this->imageLoadingIndex = static_cast<int>(i);
+
+        logx::uif("开始下载图片 %u/%u：%s",
+            static_cast<unsigned>(i + 1), static_cast<unsigned>(this->imageSlots.size()), slot.item.c_str());
+
+        this->beginTask(Task::Images, "正在下载图片 " + std::to_string(i + 1) + "/" +
+                                          std::to_string(this->imageSlots.size()));
+        this->refreshImageSummary();
+        return true;
+    }
+
+    this->imageLoadingIndex = -1;
+    return false;
+}
+
 //------------------------------ 文件 / 目录选择 ------------------------------//
 
 void MainView::openTextFilePicker(bool forUpdate)
 {
-    // 默认从项目文件夹开始找，那里就放着自动生成的 url.txt
     const std::string startPath = fsx::isDirectory(appcfg::PROJECT_DIR) ? appcfg::PROJECT_DIR : "sdmc:/";
 
     TextFilePickerView* picker = new TextFilePickerView(startPath, [this, forUpdate](const std::string& path) {
-        // 这个回调是「选择器出栈」之后被调用的，只改文本、不动视图栈
         this->loadFromFile(forUpdate, path);
     });
 
@@ -666,6 +941,35 @@ void MainView::openOutputDirPicker()
     });
 
     Application::pushView(picker);
+}
+
+void MainView::openDetailsView()
+{
+    std::string summary = "图片：未配置";
+    std::string detail  = "（在 " + std::string(appcfg::URL_FILE) +
+                          " 里用 img: 写图片链接或文件名，逗号分隔；重启程序后生效）";
+
+    if (!this->imageSlots.empty())
+    {
+        summary = "图片：" + std::to_string(this->imagesLoaded) + "/" +
+                  std::to_string(this->imageSlots.size()) + " 已加载";
+        if (this->imagesFailed > 0)
+            summary += "，" + std::to_string(this->imagesFailed) + " 张失败";
+
+        detail.clear();
+        for (size_t i = 0; i < this->imageSlots.size(); i++)
+        {
+            const ImageSlot& slot = this->imageSlots[i];
+
+            detail += std::to_string(i + 1) + ". " + slot.item + "\n";
+            if (slot.loaded)
+                detail += "   → 已加载：" + slot.cached + "\n";
+            else
+                detail += "   → 未加载\n";
+        }
+    }
+
+    Application::pushView(new DetailsView(summary, detail));
 }
 
 void MainView::setOutputDir(const std::string& path, bool persist)
@@ -696,8 +1000,6 @@ bool MainView::loadFromFile(bool forUpdate, const std::string& filePath)
     }
 
     appcfg::UrlEntry entry;
-
-    // 带上输入框里已有的内容：文件里只写了其中一项时，另一项不会被清空
     entry.update   = this->updateRow->input->text();
     entry.download = this->downloadRow->input->text();
 
@@ -705,8 +1007,8 @@ bool MainView::loadFromFile(bool forUpdate, const std::string& filePath)
     {
         logx::uif("解析失败：%s", filePath.c_str());
         this->setStatus("解析失败");
-        this->setDetail("没有从文件里找到 updata / download。\n\n文件：\n" + filePath +
-                        "\n\n期望格式：\n{ updata: 链接1 , download: 链接2 }");
+        this->setDetail("没有从文件里找到 updata / download / img。\n\n文件：\n" + filePath +
+                        "\n\n期望格式：\n{ updata: 链接1 , download: 链接2 , img: a.jpg, b.jpg }");
         return false;
     }
 
@@ -761,7 +1063,9 @@ void MainView::beginTask(Task kind, const std::string& statusText)
     this->setCancelEnabled(true);
     this->setProgress(0);
     this->setStatus(statusText);
-    this->setDetail("（任务进行中，完成后结果会显示在这里）");
+
+    if (kind != Task::Images)
+        this->setDetail("（任务进行中，完成后结果会显示在这里）");
 
     this->pollCount       = 0;
     this->lastHeartbeatAt = 0;
@@ -790,7 +1094,7 @@ void MainView::startUpdateCheck()
 
     if (this->task != Task::None || this->downloader->running())
     {
-        this->setStatus("已有任务在进行");
+        this->setStatus(this->task == Task::Images ? "正在下载图片，请稍候（可点取消）" : "已有任务在进行");
         return;
     }
 
@@ -845,7 +1149,7 @@ void MainView::startDownload()
 
     if (this->task != Task::None || this->downloader->running())
     {
-        this->setStatus("已有任务在进行");
+        this->setStatus(this->task == Task::Images ? "正在下载图片，请稍候（可点取消）" : "已有任务在进行");
         return;
     }
 
@@ -885,8 +1189,6 @@ void MainView::beginDownload(const std::string& url)
 
     const std::string target = fsx::join(this->outputDir, fileName);
 
-    // 同名文件会被直接覆盖（写入侧是「先删再建」）。提前说清楚，
-    // 免得用户以为「打开就成功了、其实没下载」。
     logx::uif("目标文件：%s（已存在=%d，将被覆盖）", target.c_str(), fsx::exists(target) ? 1 : 0);
 
     if (!this->downloader->start(url, this->outputDir))
@@ -906,18 +1208,27 @@ void MainView::onPoll()
     if (this->downloader == nullptr)
         return;
 
+    // 启动后第一次轮询：加载图片（界面这时已经画出来了）
+    if (!this->startupImagesStarted)
+    {
+        this->startStartupImageLoad();
+        return;
+    }
+
     const Downloader::State state = this->downloader->state();
 
     if (state == Downloader::State::Idle)
         return;
 
-    //========================= 进行中 =========================//
     if (state == Downloader::State::Running)
     {
         if (this->task == Task::Update)
         {
-            // 取文本没有字节数可显示，保持一行稳定的文字即可
             this->setStatus("正在检查更新…");
+        }
+        else if (this->task == Task::Images)
+        {
+            this->setProgress(this->downloader->percent());
         }
         else
         {
@@ -937,13 +1248,94 @@ void MainView::onPoll()
         return;
     }
 
-    //========================= 终态 =========================//
-    // 轮询任务常驻，所以必须靠 task 判断「这一轮是否已经收尾过」，
-    // 否则会反复处理同一个结果。
+    // 终态：靠 task 判断这一轮是否已经收尾过（轮询任务常驻，不能重复收尾）
     if (this->task == Task::None)
         return;
 
-    this->finishTask(state);
+    if (this->task == Task::Images)
+        this->finishImageTask(state);
+    else
+        this->finishTask(state);
+}
+
+void MainView::finishImageTask(Downloader::State state)
+{
+    const int index = this->imageLoadingIndex;
+    this->imageLoadingIndex = -1;
+
+    logx::uif("图片下载收尾：index=%d state=%d", index, static_cast<int>(state));
+
+    if (state == Downloader::State::Finished && index >= 0)
+    {
+        const std::string path = this->downloader->outputPath();
+
+        if (!path.empty())
+            this->loadImageIntoSlot(static_cast<size_t>(index), path);
+        else
+            this->imagesFailed++;
+    }
+    else if (index >= 0)
+    {
+        this->imagesFailed++;
+        logx::uif("图片 %d 下载未成功：%s", index + 1, this->downloader->errorText().c_str());
+    }
+
+    this->refreshImageSummary();
+
+    // 用户取消 → 整个批量就此收住，别继续下一张
+    if (state == Downloader::State::Cancelled)
+    {
+        size_t remaining = 0;
+        for (ImageSlot& slot : this->imageSlots)
+        {
+            if (slot.pending && !slot.loaded)
+            {
+                slot.pending = false;
+                remaining++;
+            }
+        }
+
+        this->task = Task::None;
+        this->setButtonsEnabled(true);
+        this->setCancelEnabled(false);
+        this->setProgress(0);
+        this->setStatus("图片下载已取消");
+        this->setDetail("已取消，还剩 " + std::to_string(remaining) + " 张没下载。下次启动会继续。");
+        logx::ui("图片批量下载被取消");
+        return;
+    }
+
+    // 有失败就先停：多半是网络/地址的问题，继续试只会让用户干等
+    if (state != Downloader::State::Finished)
+    {
+        this->task = Task::None;
+        this->setButtonsEnabled(true);
+        this->setCancelEnabled(false);
+        this->setProgress(0);
+        this->setStatus("图片下载中断");
+        this->setDetail("第 " + std::to_string(index + 1) + " 张失败：" +
+                        this->downloader->errorText() + "\n\n已加载成功的图片会保留，下次启动会重试其余的。");
+        return;
+    }
+
+    if (this->startNextPendingImage())
+        return;
+
+    // 全部处理完
+    this->task = Task::None;
+    this->setButtonsEnabled(true);
+    this->setCancelEnabled(false);
+    this->setProgress(100);
+    this->setStatus("图片已加载 " + std::to_string(this->imagesLoaded) + "/" +
+                    std::to_string(this->imageSlots.size()));
+
+    if (this->imagesFailed > 0)
+        this->setDetail("有 " + std::to_string(this->imagesFailed) + " 张图片没能加载（详见日志）。");
+    else
+        this->setDetail("图片都在下面了。要换图就改 " + std::string(appcfg::URL_FILE) +
+                        " 里的 img: 行，然后重启程序。");
+
+    logx::ui("图片批量下载完成");
 }
 
 void MainView::finishTask(Downloader::State state)
@@ -951,7 +1343,6 @@ void MainView::finishTask(Downloader::State state)
     const Task kind = this->task;
     this->task      = Task::None;
 
-    // 每一步都留一条面包屑：万一真机还是卡住，日志里能直接看出卡在哪个调用上。
     logx::uif("任务收尾开始：kind=%d state=%d", static_cast<int>(kind), static_cast<int>(state));
 
     this->setButtonsEnabled(true);
@@ -968,7 +1359,8 @@ void MainView::finishTask(Downloader::State state)
 
             const std::string shown = capText(all, MAX_RESULT_DISPLAY);
 
-            this->setStatus("检查完成：HTTP " + std::to_string(code) + " · " + fsx::formatBytes(static_cast<s64>(all.size())));
+            this->setStatus("检查完成：HTTP " + std::to_string(code) + " · " +
+                            fsx::formatBytes(static_cast<s64>(all.size())));
             logx::uif("状态行已更新");
 
             this->setDetail(shown.empty() ? "（服务器返回了空内容）" : shown);
@@ -989,7 +1381,6 @@ void MainView::finishTask(Downloader::State state)
         }
         else if (!this->downloader->bodyText().empty())
         {
-            // 有些服务器在 4xx/5xx 里也返回有用的说明，一并带出来
             text += "\n\n服务器返回：\n" + capText(this->downloader->bodyText(), MAX_RESULT_DISPLAY);
         }
 
