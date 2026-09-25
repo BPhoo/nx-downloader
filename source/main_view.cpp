@@ -1668,7 +1668,27 @@ void MainView::finishImageTask(Downloader::State state)
     else if (index >= 0)
     {
         this->imagesFailed++;
-        logx::uif("图片 %d 下载未成功：%s", index + 1, this->downloader->errorText().c_str());
+
+        const std::string err = this->downloader->errorText();
+
+        // 失败原因存进 slot：底部「诊断信息」会逐张列出来，用户不用猜
+        if (static_cast<size_t>(index) < this->imageSlots.size())
+        {
+            ImageSlot& slot = this->imageSlots[static_cast<size_t>(index)];
+            slot.note       = err;
+
+            // SSL 类失败：三档（校验证书 / 不校验 / 不校验+HTTP1.1+TLS1.2）都试过了
+            // 还是握不上手，说明这个地址在 Switch 上就是连不通。
+            // 给一条能直接照做的建议，比只显示一句英文错误有用得多。
+            if (err.find("SSL") != std::string::npos || err.find("证书") != std::string::npos)
+                slot.note += "（已试 4 种传输配置仍握手失败：换图片地址，或先把图拷到 SD 卡用文件名引用）";
+
+            logx::uif("图片 %d 下载未成功：%s", index + 1, slot.note.c_str());
+        }
+        else
+        {
+            logx::uif("图片 %d 下载未成功：%s", index + 1, err.c_str());
+        }
     }
 
     this->refreshImageSummary();

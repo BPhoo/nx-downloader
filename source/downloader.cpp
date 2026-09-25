@@ -308,7 +308,8 @@ enum class TlsStage
 {
     Verify = 0,      // ① 正常校验 HTTPS 证书
     NoVerify,        // ② 关掉证书校验（设备上没有 CA 链时的兜底）
-    LegacyHttp11,    // ③ 关校验 + 强制 HTTP/1.1 + 至少 TLS1.2（握手协商失败时用）
+    Tls12Only,       // ③ 不校验 + HTTP/1.1 + **把 TLS 钉死在 1.2**
+    Tls10Only,       // ④ 不校验 + HTTP/1.1 + **把 TLS 钉死在 1.0**（最保守的一档）
 };
 
 const char* tlsStageName(TlsStage stage)
@@ -319,8 +320,10 @@ const char* tlsStageName(TlsStage stage)
             return "校验证书";
         case TlsStage::NoVerify:
             return "不校验证书";
+        case TlsStage::Tls12Only:
+            return "不校验+HTTP1.1+仅TLS1.2";
         default:
-            return "不校验+HTTP1.1+TLS1.2";
+            return "不校验+HTTP1.1+仅TLS1.0";
     }
 }
 
@@ -330,7 +333,9 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+    // 第一次给足 15 秒；降档重试时 8 秒就够 ——
+    // 既然前一档已经失败过，多半是连不上，没必要每次都等满（4 档下来也不过 ~39 秒）
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (stage == TlsStage::Verify) ? 15L : 8L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "nx-downloader/2.1 (Nintendo Switch; libnx)");
@@ -366,18 +371,27 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
 
-    // 最后一档：把协议栈压到最保守的组合。
-    //   switch-curl 走 mbedTLS；部分 CDN 在协商 ALPN(h2) 或谈 TLS1.3 时会
-    //   直接把连接断开，libcurl 侧看到的就只有一句 CURLE_SSL_CONNECT_ERROR。
-    //   强制 HTTP/1.1 + 至少 TLS1.2 是这类问题最有效的绕法。
-    if (stage == TlsStage::LegacyHttp11)
+    // 后面两档：把协议栈压到最保守的组合。
+    //
+    //   ★ 为什么要把 TLS 版本**钉死**（而不只是设最低版本）：
+    //     `CURLOPT_SSLVERSION = CURL_SSLVERSION_TLSv1_2` 在 libcurl 里的含义是
+    //    「**最低** 1.2」，仍然允许协商到 1.3。而 switch-curl 走的是 mbedTLS 2.x，
+    //     它对 TLS1.3 的支持并不完整 —— 一旦握手往 1.3 走，失败时 libcurl 只报一句
+    //     CURLE_SSL_CONNECT_ERROR(35)，看不出是版本问题。
+    //     真机实测 shared.fastly.steamstatic.com 三档（校验 / 不校验 /
+    //     不校验+HTTP1.1+最低TLS1.2）全部 35，所以这里补两档把上限也钉死。
+    //
+    //   写法：`min | max`，libcurl 7.54.1 起支持 CURL_SSLVERSION_MAX_*。
+    if (stage == TlsStage::Tls12Only || stage == TlsStage::Tls10Only)
     {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_1_1));
-#if LIBCURL_VERSION_NUM >= 0x073400
-        curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2));
-#else
-        curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1));
-#endif
+
+        const bool v12 = (stage == TlsStage::Tls12Only);
+
+        const long minVer = v12 ? CURL_SSLVERSION_TLSv1_2 : CURL_SSLVERSION_TLSv1;
+        const long maxVer = v12 ? CURL_SSLVERSION_MAX_TLSv1_2 : CURL_SSLVERSION_MAX_TLSv1;
+
+        curl_easy_setopt(curl, CURLOPT_SSLVERSION, minVer | maxVer);
     }
 }
 
@@ -611,6 +625,13 @@ void Downloader::run()
         return;
     }
 
+    // ★ 拿到 curl / mbedTLS 的**原文**错误文本。
+    //   curl_easy_strerror() 只有一句「SSL connect error」，看不出到底是
+    //   连接被重置、对端不支持协议、还是证书问题。握不上手时这是唯一的线索。
+    char errBuf[CURL_ERROR_SIZE];
+    std::memset(errBuf, 0, sizeof(errBuf));
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errBuf);
+
     const std::string caBundle = findCaBundle();
 
     logx::linef("网络任务开始(%s): %s", prog->mode == Mode::ToMemory ? "取文本" : "下载文件",
@@ -620,11 +641,17 @@ void Downloader::run()
 
     CURLcode rc = CURLE_OK;
 
-    // 最多三档：① 校验证书 → ② 不校验证书 → ③ 不校验 + HTTP/1.1 + TLS1.2。
-    // 每一档失败且错误属于「SSL 类」时，删掉半成品再降一档重试。
-    // 真机实测：国内网盘（证书链不全）在第 ② 档就通；Steam 的 CDN 要到第 ③ 档。
-    static const TlsStage STAGES[] = { TlsStage::Verify, TlsStage::NoVerify, TlsStage::LegacyHttp11 };
-    constexpr int STAGE_COUNT      = static_cast<int>(sizeof(STAGES) / sizeof(STAGES[0]));
+    // 最多四档，一档比一档保守；每一档失败且错误属于「SSL 类」时，
+    // 删掉半成品再降一档重试。真机实测的落点：
+    //   国内网盘（证书链不全）      → 第 ② 档就通
+    //   Steam CDN（mbedTLS 版本问题）→ 需要第 ③/④ 档把 TLS 版本钉死
+    static const TlsStage STAGES[] = {
+        TlsStage::Verify,    // ① 校验证书
+        TlsStage::NoVerify,  // ② 不校验证书
+        TlsStage::Tls12Only, // ③ 不校验 + HTTP/1.1 + 只用 TLS1.2
+        TlsStage::Tls10Only, // ④ 不校验 + HTTP/1.1 + 只用 TLS1.0
+    };
+    constexpr int STAGE_COUNT = static_cast<int>(sizeof(STAGES) / sizeof(STAGES[0]));
 
     for (int attempt = 0; attempt < STAGE_COUNT; attempt++)
     {
@@ -636,6 +663,7 @@ void Downloader::run()
 
         prog->percent.store(0);
         prog->cancelRequested.store(false);
+        errBuf[0] = '\0';
 
         applyOptions(curl, &ctx, prog->url, caBundle, stage);
 
@@ -645,6 +673,26 @@ void Downloader::run()
             attempt + 1, STAGE_COUNT, tlsStageName(stage),
             static_cast<int>(rc), curl_easy_strerror(rc),
             static_cast<long long>(ctx.offset), static_cast<unsigned>(ctx.body.size()));
+
+        if (rc != CURLE_OK)
+        {
+            // 握手/连接失败时，这四个数字是唯一定性的依据：
+            //   OS errno  : 0=协议层失败；104(ECONNRESET)/110(ETIMEDOUT)/113=被中途掐断
+            //   对端 IP   : 能连上说明 DNS 与 TCP 都通，问题在 TLS 之后
+            //   SSL verify: 证书验证结果（非 0 时才是证书问题）
+            long osErrno = 0;
+            curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &osErrno);
+
+            const char* ip = nullptr;
+            curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &ip);
+
+            long sslResult = 0;
+            curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &sslResult);
+
+            logx::linef("  | curl 原文：%s", errBuf[0] != '\0' ? errBuf : "(curl 未给出文本)");
+            logx::linef("  + OS errno=%ld，对端 IP=%s，SSL verify=%ld",
+                osErrno, (ip != nullptr && ip[0] != '\0') ? ip : "(未连上)", sslResult);
+        }
 
         if (ctx.fileOpen)
         {
