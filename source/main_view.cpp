@@ -1281,60 +1281,63 @@ void MainView::toggleDiagnostics()
     // ★ 文本刻意压得很短（两段加起来几百字节），而且到点按钮这一刻才生成。
     //   主界面单帧要排版的文本越少越不容易出问题；完整信息永远在文件里：
     //   log.txt（全过程诊断）+ update_result.txt（上次返回内容）。
-    if (!this->diagReady)
+    // ★ 每次展开都重新生成：文本量很小，但会随图片加载结果变化，
+    //   缓存起来反而会让人看到上一次的旧状态。
+    logx::ui("诊断信息：构建文本");
+
+    std::string info;
+    info += "环境：" + netx::describe() + "\n";
+    info += "目录：" + std::string(appcfg::PROJECT_DIR) + "\n";
+    info += "详细日志与返回内容：同目录的 log.txt / update_result.txt\n";
+
+    std::string result;
+    if (fsx::readWholeFile(appcfg::RESULT_FILE, &result) && !result.empty())
+        info += "上次返回内容：" + fsx::formatBytes(static_cast<s64>(result.size())) + "\n";
+    else
+        info += "上次返回内容：还没有记录\n";
+
+    if (logx::writeFailed())
+        info += "⚠ 日志写入失败（SD 卡），log.txt 可能不完整\n";
+
+    if (!this->startupNotice.empty())
+        info += "启动提示：" + this->startupNotice + "\n";
+
+    this->diagText = info;
+    logx::uif("诊断信息：环境段 %u 字节", static_cast<unsigned>(info.size()));
+
+    std::string images;
+
+    if (this->imageSlots.empty())
     {
-        logx::ui("诊断信息：构建文本");
-
-        std::string info;
-        info += "环境：" + netx::describe() + "\n";
-        info += "目录：" + std::string(appcfg::PROJECT_DIR) + "\n";
-        info += "详细日志与返回内容：同目录的 log.txt / update_result.txt\n";
-
-        std::string result;
-        if (fsx::readWholeFile(appcfg::RESULT_FILE, &result) && !result.empty())
-            info += "上次返回内容：" + fsx::formatBytes(static_cast<s64>(result.size())) + "\n";
-        else
-            info += "上次返回内容：还没有记录\n";
-
-        if (logx::writeFailed())
-            info += "⚠ 日志写入失败（SD 卡），log.txt 可能不完整\n";
-
-        if (!this->startupNotice.empty())
-            info += "启动提示：" + this->startupNotice + "\n";
-
-        this->diagText = info;
-        logx::uif("诊断信息：环境段 %u 字节", static_cast<unsigned>(info.size()));
-
-        std::string images;
-
-        if (this->imageSlots.empty())
-        {
-            images = "图片：未配置（在 url.txt 里用 img: 指定）";
-        }
-        else
-        {
-            images = "图片：" + std::to_string(this->imagesLoaded) + "/" +
-                     std::to_string(this->imageSlots.size()) + " 已加载，显存 " +
-                     std::to_string(this->imagePixelsUsed / 1000000u) + "M/" +
-                     std::to_string(imagePixelBudget() / 1000000u) + "M 像素\n";
-
-            for (size_t i = 0; i < this->imageSlots.size(); i++)
-            {
-                const ImageSlot& slot = this->imageSlots[i];
-
-                images += std::to_string(i + 1) + ".";
-                images += slot.loaded
-                              ? std::string(" 已加载")
-                              : (std::string(" 失败：") + (slot.note.empty() ? "原因未知" : slot.note));
-                images += "\n";
-            }
-        }
-
-        this->diagImagesText = images;
-        logx::uif("诊断信息：图片段 %u 字节", static_cast<unsigned>(images.size()));
-
-        this->diagReady = true;
+        images = "图片：未配置（在 url.txt 里用 img: 指定）";
     }
+    else
+    {
+        images = "图片：" + std::to_string(this->imagesLoaded) + "/" +
+                 std::to_string(this->imageSlots.size()) + " 已加载，显存 " +
+                 std::to_string(this->imagePixelsUsed / 1000000u) + "M/" +
+                 std::to_string(imagePixelBudget() / 1000000u) + "M 像素\n";
+
+        for (size_t i = 0; i < this->imageSlots.size(); i++)
+        {
+            const ImageSlot& slot = this->imageSlots[i];
+
+            images += std::to_string(i + 1) + ".";
+            images += slot.loaded
+                          ? std::string(" 已加载")
+                          : (std::string(" 失败：") + (slot.note.empty() ? "原因未知" : slot.note));
+            images += "\n";
+        }
+
+        // ★ 底层诊断：SSL 类错误只显示一句「35」是没法判断原因的，
+        //   这里把 curl 原文 / OS errno / 对端 IP 直接写出来 —— 截图就能看。
+        const std::string diag = this->downloader != nullptr ? this->downloader->diagText() : std::string();
+        if (!diag.empty())
+            images += "\n底层诊断：" + diag;
+    }
+
+    this->diagImagesText = images;
+    logx::uif("诊断信息：图片段 %u 字节", static_cast<unsigned>(images.size()));
 
     logx::ui("诊断信息：展开");
     this->diagLabel->setText(this->diagText);
@@ -1716,19 +1719,11 @@ void MainView::finishImageTask(Downloader::State state)
         return;
     }
 
-    // 有失败就先停：多半是网络/地址的问题，继续试只会让用户干等
-    if (state != Downloader::State::Finished)
-    {
-        this->task = Task::None;
-        this->setButtonsEnabled(true);
-        this->setCancelEnabled(false);
-        this->setProgress(0);
-        this->setStatus("图片下载中断");
-        this->setDetail("第 " + std::to_string(index + 1) + " 张失败：" +
-                        this->downloader->errorText() + "\n\n已加载成功的图片会保留，下次启动会重试其余的。");
-        return;
-    }
-
+    // ★ 这一张失败**不再中断整批**，继续下一张。
+    //   旧逻辑是「有失败就停」，结果第 1 张失败后 2/3/4 张压根不试 ——
+    //   而这些图很可能来自别的域名，或者本来就是本地文件（根本不需要联网），
+    //   一竿子打死等于把能显示的也一起丢了。每张失败的原因各自记在 slot 里，
+    //   诊断区会逐张列出来。
     if (this->startNextPendingImage())
         return;
 
@@ -1741,10 +1736,32 @@ void MainView::finishImageTask(Downloader::State state)
                     std::to_string(this->imageSlots.size()));
 
     if (this->imagesFailed > 0)
-        this->setDetail("有 " + std::to_string(this->imagesFailed) + " 张图片没能加载（详见日志）。");
+    {
+        // 把**第一张失败的原因和底层诊断**直接写出来：
+        // 用户不用连电脑取 log.txt，看这一屏就够了。
+        std::string text = "有 " + std::to_string(this->imagesFailed) + " 张没能加载。\n";
+
+        for (const ImageSlot& slot : this->imageSlots)
+        {
+            if (!slot.loaded && !slot.note.empty())
+            {
+                text += "失败原因：" + slot.note + "\n";
+                break;
+            }
+        }
+
+        const std::string diag = this->downloader != nullptr ? this->downloader->diagText() : std::string();
+        if (!diag.empty())
+            text += "\n底层诊断：" + diag;
+
+        this->setDetail(text);
+        logx::uif("图片批量结束：%d 张失败；诊断=%s", this->imagesFailed, diag.c_str());
+    }
     else
+    {
         this->setDetail("图片都在下面了。要换图就改 " + std::string(appcfg::URL_FILE) +
                         " 里的 img: 行，然后重启程序。");
+    }
 
     logx::ui("图片批量下载完成");
 }

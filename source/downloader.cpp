@@ -580,6 +580,16 @@ std::string Downloader::errorText() const
     return prog->error;
 }
 
+std::string Downloader::diagText() const
+{
+    std::shared_ptr<Progress> prog = this->progress;
+    if (!prog)
+        return "";
+
+    std::lock_guard<std::mutex> lock(prog->mtx);
+    return prog->diag;
+}
+
 std::string Downloader::outputPath() const
 {
     std::shared_ptr<Progress> prog = this->progress;
@@ -694,6 +704,23 @@ void Downloader::run()
             logx::linef("  | curl 原文：%s", errBuf[0] != '\0' ? errBuf : "(curl 未给出文本)");
             logx::linef("  + OS errno=%ld，对端 IP=%s，SSL verify=%ld",
                 osErrno, (ip != nullptr && ip[0] != '\0') ? ip : "(未连上)", sslResult);
+
+            // ★ 第一次（正常配置那一档）的细节最有诊断价值，存下来给界面显示：
+            //   用户不用连电脑取 log.txt，在诊断区里截个图就行。
+            //   SSL 类错误只报一句「35」根本判断不出原因，这四个数字才是依据。
+            if (attempt == 0)
+            {
+                std::lock_guard<std::mutex> lock(prog->mtx);
+
+                char head[256];
+                std::snprintf(head, sizeof(head), "curl=%d(%s) OS errno=%ld 对端 IP=%s SSL verify=%ld",
+                    static_cast<int>(rc), curl_easy_strerror(rc), osErrno,
+                    (ip != nullptr && ip[0] != '\0') ? ip : "(未连上)", sslResult);
+
+                prog->diag = std::string(head);
+                if (errBuf[0] != '\0')
+                    prog->diag += "\n原文：" + std::string(errBuf);
+            }
         }
 
         if (ctx.fileOpen)

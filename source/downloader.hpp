@@ -66,6 +66,9 @@ class Downloader
         std::string outputPath;
         std::string finalUrl;
         std::string error;
+        /// 第一次失败（正常配置那一档）的底层诊断：curl 原文 + OS errno + 对端 IP。
+        /// 存下来是为了**显示在界面上** —— 用户截图就能看到，不用连电脑取 log.txt。
+        std::string diag;
         /// 内存模式的响应体（ToMemory 才有内容）
         std::string body;
         /// 内存模式的响应体是否因为超过上限被截断
@@ -114,6 +117,10 @@ class Downloader
     /// 内存模式下拉到的响应体（任务结束后才有意义）
     std::string bodyText() const;
     bool bodyTruncated() const;
+
+    /// 最近一次失败时记录的底层诊断（curl 原文 / OS errno / 对端 IP）。
+    /// 给界面显示用：SSL 类错误只报一句「35」是没法判断原因的。
+    std::string diagText() const;
 
     /// 检查 URL 是否是我们支持的协议
     static bool isSupportedUrl(const std::string& url);
