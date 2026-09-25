@@ -388,8 +388,10 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
 
         const bool v12 = (stage == TlsStage::Tls12Only);
 
+        // ★ MAX_* 这一族的名字带版本号后缀：是 CURL_SSLVERSION_MAX_TLSv1_0，
+        //   不是 CURL_SSLVERSION_MAX_TLSv1（后者不存在，编译期就会报未声明）。
         const long minVer = v12 ? CURL_SSLVERSION_TLSv1_2 : CURL_SSLVERSION_TLSv1;
-        const long maxVer = v12 ? CURL_SSLVERSION_MAX_TLSv1_2 : CURL_SSLVERSION_MAX_TLSv1;
+        const long maxVer = v12 ? CURL_SSLVERSION_MAX_TLSv1_2 : CURL_SSLVERSION_MAX_TLSv1_0;
 
         curl_easy_setopt(curl, CURLOPT_SSLVERSION, minVer | maxVer);
     }
