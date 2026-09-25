@@ -29,6 +29,7 @@
 #include <nanovg/nanovg.h>
 
 #include "app_config.hpp"
+#include "console_mode.hpp"
 #include "downloader.hpp"
 #include "fsx.hpp"
 #include "logx.hpp"
@@ -212,7 +213,49 @@ int main(int argc, char* argv[])
     }
 
     //------------------------------------------------------------------
-    // 6. borealis
+    // 6. ★ 界面分支：Applet 模式 → 文字（控制台）模式
+    //
+    //    真机上 Applet 模式（从相册启动）会在**构造图形界面**的过程中整机死机
+    //    （冻结点落在纯 CPU 的视图树构造里，紧跟在一次 SD 写盘之后，详见 BUILD.md §1）。
+    //    与其继续赌，不如在这条路径上直接改用纯 libnx 控制台：
+    //      * 不创建 GL 上下文、不用 nanovg / borealis / 字体；
+    //      * 功能保留「检查更新 / 下载文件 / 重新读 url.txt / SD 卡 I/O 自检」。
+    //
+    //    这同时也是一次决定性实验：文字模式若在 Applet 模式下活得好好的，
+    //    说明问题在 borealis/GL 那条栈上；若它也卡死，就是 Applet 环境本身的问题。
+    //
+    //    两个开关文件（放在项目文件夹里）方便真机上反复验证，不用改代码重新编译：
+    //      console.txt = 强制文字模式（完整内存模式下也能验证文字界面）
+    //      gui.txt     = 强制图形界面（Applet 模式下也能再试一次图形界面）
+    //------------------------------------------------------------------
+    const bool isApplet   = appletGetAppletType() != AppletType_Application;
+    const bool wantGui    = fsx::exists(std::string(appcfg::PROJECT_DIR) + "/gui.txt");
+    const bool wantText   = fsx::exists(std::string(appcfg::PROJECT_DIR) + "/console.txt");
+    const bool useConsole = (!wantGui && (isApplet || wantText));
+
+    logx::linef("界面选择：appletType=%d（isApplet=%d）强制文字=%d 强制图形=%d → %s",
+        static_cast<int>(appletGetAppletType()), isApplet ? 1 : 0, wantText ? 1 : 0, wantGui ? 1 : 0,
+        useConsole ? "文字（控制台）模式" : "图形界面");
+
+    if (useConsole)
+    {
+        logx::ui("不初始化 borealis / GL，直接进文字模式");
+
+        const int code = consmode::run(&g_downloader, urlEntry);
+
+        logx::ui("文字模式退出，开始收尾");
+        g_downloader.requestCancel();
+        g_downloader.join();
+        curl_global_cleanup();
+        logx::close();
+        fsx::exit();
+        netx::exit();
+        romfsExit();
+        return code;
+    }
+
+    //------------------------------------------------------------------
+    // 7. borealis（只用于完整内存模式；按住 R 从游戏图标启动）
     //------------------------------------------------------------------
     brls::Logger::setLogLevel(brls::LogLevel::INFO);
 
@@ -234,7 +277,7 @@ int main(int argc, char* argv[])
     logx::linef("applet 状态：%s", netx::appletStateText().c_str());
 
     //------------------------------------------------------------------
-    // 7. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
+    // 8. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
     //    否则英文/日文主机上的中文会全是方块
     //------------------------------------------------------------------
     attachChineseFallbackFont();
