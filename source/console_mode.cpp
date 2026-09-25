@@ -106,18 +106,26 @@ const char* stateName(Downloader::State s)
 }
 
 /// 等当前任务跑完，同时把进度打到屏幕上（每变化 5% 打一行）
+///
+/// ⚠️ 这个循环里**绝对不能**用 appletMainLoop()：
+///    它内部是 eventWait(&g_appletMessageEvent, 0) —— 0 表示无限等待，
+///    只有系统发 applet 消息（HOME、焦点变化、退出请求）才会返回，
+///    **按键不会唤醒它**。放在循环条件里 = 整个程序卡在那儿等消息，
+///    表现就是「任何按键都没反应，只有 HOME 键有效」。
+///    所以这里纯轮询，并加一个上限防止真的挂死时永远转下去。
 void waitTask(Downloader* downloader, const char* what)
 {
     int lastPercent = -10;
     int stall       = 0;
+    int waitedMs    = 0;
+
+    constexpr int STEP_MS    = 100;
+    constexpr int MAX_WAIT_MS = 10 * 60 * 1000; // 10 分钟上限
 
     out(std::string("  ") + what + " ...");
 
     while (true)
     {
-        if (!appletMainLoop())
-            return; // applet 被要求退出
-
         const Downloader::State state = downloader->state();
 
         if (state == Downloader::State::Running)
@@ -138,7 +146,13 @@ void waitTask(Downloader* downloader, const char* what)
                 out(line);
             }
 
-            svcSleepThread(100 * 1000 * 1000); // 100ms
+            svcSleepThread(STEP_MS * 1000 * 1000);
+            waitedMs += STEP_MS;
+            if (waitedMs > MAX_WAIT_MS)
+            {
+                out("  gave up waiting after 10 min (press + to exit)");
+                return;
+            }
             continue;
         }
 
@@ -157,7 +171,7 @@ void waitTask(Downloader* downloader, const char* what)
         // 状态可能还在 Idle（刚启动），给几拍缓冲
         if (state == Downloader::State::Idle && stall++ < 5)
         {
-            svcSleepThread(100 * 1000 * 1000);
+            svcSleepThread(STEP_MS * 1000 * 1000);
             continue;
         }
 
@@ -342,19 +356,41 @@ bool reloadUrl(appcfg::UrlEntry* entry)
     return true;
 }
 
+/// 输入状态。文字模式里这是**最有价值的诊断信息**：
+///   style 恒为 0 → 系统没把本程序识别成「支持手柄」（缺 padConfigureInput）
+///   active 为 0  → 手柄没连上，或被系统收走了
+PadState g_pad      = {};
+bool     g_padReady = false;
+
+std::string padStatus()
+{
+    if (!g_padReady)
+        return "not ready (hid init failed, buttons disabled)";
+
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "style=0x%X active=0x%X%s buttons=0x%llX",
+        static_cast<unsigned>(g_pad.style_set),
+        static_cast<unsigned>(g_pad.active_id_mask),
+        g_pad.active_handheld ? " handheld" : "",
+        static_cast<unsigned long long>(g_pad.buttons_cur));
+
+    return std::string(buf);
+}
+
 void printMenu(const appcfg::UrlEntry& entry)
 {
     out("");
     out("  updata   : " + (entry.update.empty() ? std::string("(empty)") : ascii(entry.update, 60)));
     out("  download : " + (entry.download.empty() ? std::string("(empty)") : ascii(entry.download, 60)));
-    out("  img      : " + std::to_string(entry.images.size()) + " item(s), not shown here");
+    out("  img      : " + std::to_string(entry.images.size()) + " item(s) - use the GUI mode for images");
     out("");
     out("  [A] check update (show returned text)");
     out("  [B] download to project folder");
     out("  [X] reload url.txt");
     out("  [Y] SD card I/O self-test");
-    out("  [+] exit");
+    out("  [+] exit (HOME is handled by the system)");
     out("");
+    out("  input: " + padStatus());
 }
 
 } // namespace
@@ -377,40 +413,82 @@ int run(Downloader* downloader, const appcfg::UrlEntry& entry)
     out("log     : " + ascii(appcfg::LOG_FILE));
     logx::ui("文字（控制台）模式已启动");
 
+    //------------------------------------------------------------------
+    // 输入初始化。真机上「任何按键都没反应、只有 HOME 有效」的两个原因，
+    // 这里一次解决：
+    //
+    //  ① hid 服务没初始化。按键状态全在 hid 的**共享内存**里，
+    //     没调 hidInitialize() 就永远读到 0。
+    //  ② 没调 padConfigureInput()。它负责告诉系统「本程序支持这些手柄类型」
+    //     （内部 = hidInitializeNpad + hidSetSupportedNpadIdType/StyleSet）。
+    //     少了它，系统给的 style_set 恒为 0，而 padUpdate() 里有
+    //     `if (style_set == 0) continue;` —— 所有手柄都被跳过，按键恒为 0。
+    //
+    //  ③ 主循环**不能**用 appletMainLoop()（它内部是无限等待的 eventWait，
+    //     只有系统消息能唤醒，按键不会）。见 waitTask 上方的说明。
+    //------------------------------------------------------------------
+    const Result hidRc = hidInitialize();
+    const bool   hidOk = R_SUCCEEDED(hidRc) ||
+                         R_VALUE(hidRc) == MAKERESULT(Module_Libnx, LibnxError_AlreadyInitialized);
+
+    logx::linef("文字模式：hidInitialize = %s（%s）", logx::result(hidRc).c_str(), hidOk ? "OK" : "FAILED");
+
+    if (hidOk)
+    {
+        padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+        padInitializeDefault(&g_pad); // 读 No1 + Handheld（掌机模式）
+        padUpdate(&g_pad);
+        g_padReady = true;
+
+        logx::linef("文字模式：输入已就绪（%s）", padStatus().c_str());
+    }
+    else
+    {
+        out("  !! hidInitialize failed: " + logx::result(hidRc));
+        out("  !! buttons will NOT work in this session");
+    }
+
     appcfg::UrlEntry current = entry;
     printMenu(current);
 
-    PadState pad;
-    padInitializeDefault(&pad);
-
-    while (appletMainLoop())
+    while (true)
     {
-        padUpdate(&pad);
-        const u64 down = padGetButtonsDown(&pad);
+        if (g_padReady)
+        {
+            padUpdate(&g_pad);
+            const u64 down = padGetButtonsDown(&g_pad);
 
-        if (down & HidNpadButton_Plus)
-            break;
+            if (down != 0)
+            {
+                // 记进日志：万一菜单没刷新，至少 log.txt 能证明「按键被读到了」
+                logx::linef("文字模式：按键 mask=0x%llX（%s）",
+                    static_cast<unsigned long long>(down), padStatus().c_str());
+            }
 
-        if (down & HidNpadButton_A)
-        {
-            checkUpdate(downloader, current.update);
-            printMenu(current);
-        }
-        else if (down & HidNpadButton_B)
-        {
-            downloadFile(downloader, current.download);
-            printMenu(current);
-        }
-        else if (down & HidNpadButton_X)
-        {
-            out("  reloading url.txt ...");
-            out(reloadUrl(&current) ? "  ok" : "  failed");
-            printMenu(current);
-        }
-        else if (down & HidNpadButton_Y)
-        {
-            ioTest();
-            printMenu(current);
+            if (down & HidNpadButton_Plus)
+                break;
+
+            if (down & HidNpadButton_A)
+            {
+                checkUpdate(downloader, current.update);
+                printMenu(current);
+            }
+            else if (down & HidNpadButton_B)
+            {
+                downloadFile(downloader, current.download);
+                printMenu(current);
+            }
+            else if (down & HidNpadButton_X)
+            {
+                out("  reloading url.txt ...");
+                out(reloadUrl(&current) ? "  ok" : "  failed");
+                printMenu(current);
+            }
+            else if (down & HidNpadButton_Y)
+            {
+                ioTest();
+                printMenu(current);
+            }
         }
 
         svcSleepThread(50 * 1000 * 1000); // 50ms

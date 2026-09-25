@@ -274,15 +274,57 @@ size_t headerCallback(char* buffer, size_t size, size_t nitems, void* userdata)
     return len;
 }
 
-/// 证书链问题：值得用「不校验证书」再试一次
-bool isCertError(CURLcode code)
+/// 这个错误值不值得「换一条更保守的传输配置」再试一次。
+///
+/// ★ 覆盖范围必须包含 CURLE_SSL_CONNECT_ERROR(35) —— 这是真机日志里踩到的：
+///   Steam 的 CDN（Fastly）在 Switch 的 mbedTLS 上握手失败，报的正是 35；
+///   而国内网盘（证书链不全）报的是 60。
+///   v2.6.0 只认 60/58/77，所以那 4 张图片一次就放弃了
+///   （日志里每张只有一行 curl_easy_perform，等于没走降级）。
+bool isSslRetryable(CURLcode code)
 {
-    return code == CURLE_PEER_FAILED_VERIFICATION ||
-           code == CURLE_SSL_CACERT_BADFILE ||
-           code == CURLE_SSL_CERTPROBLEM;
+    switch (code)
+    {
+        case CURLE_PEER_FAILED_VERIFICATION: // 60 证书链验证失败（最典型）
+        case CURLE_SSL_CONNECT_ERROR:        // 35 SSL 握手失败（ALPN / TLS 版本 / CDN 差异）
+        case CURLE_SSL_CERTPROBLEM:          // 58
+        case CURLE_SSL_CIPHER:               // 59
+        case CURLE_SSL_CACERT_BADFILE:       // 77
+        case CURLE_SSL_ISSUER_ERROR:         // 83
+        case CURLE_SSL_CRL_BADFILE:          // 82
+        case CURLE_SSL_INVALIDCERTSTATUS:    // 91
+        case CURLE_SSL_PINNEDPUBKEYNOTMATCH: // 90
+        case CURLE_SSL_SHUTDOWN_FAILED:      // 80
+        case CURLE_SSL_ENGINE_NOTFOUND:      // 53
+        case CURLE_SSL_ENGINE_SETFAILED:     // 54
+            return true;
+        default:
+            return false;
+    }
 }
 
-void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::string& caBundle, bool verify)
+/// 传输档位：一档比一档保守，失败就降一档重试
+enum class TlsStage
+{
+    Verify = 0,      // ① 正常校验 HTTPS 证书
+    NoVerify,        // ② 关掉证书校验（设备上没有 CA 链时的兜底）
+    LegacyHttp11,    // ③ 关校验 + 强制 HTTP/1.1 + 至少 TLS1.2（握手协商失败时用）
+};
+
+const char* tlsStageName(TlsStage stage)
+{
+    switch (stage)
+    {
+        case TlsStage::Verify:
+            return "校验证书";
+        case TlsStage::NoVerify:
+            return "不校验证书";
+        default:
+            return "不校验+HTTP1.1+TLS1.2";
+    }
+}
+
+void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::string& caBundle, TlsStage stage)
 {
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -311,7 +353,7 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
 
-    if (verify)
+    if (stage == TlsStage::Verify)
     {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
@@ -322,6 +364,20 @@ void applyOptions(CURL* curl, Transfer* ctx, const std::string& url, const std::
     {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    // 最后一档：把协议栈压到最保守的组合。
+    //   switch-curl 走 mbedTLS；部分 CDN 在协商 ALPN(h2) 或谈 TLS1.3 时会
+    //   直接把连接断开，libcurl 侧看到的就只有一句 CURLE_SSL_CONNECT_ERROR。
+    //   强制 HTTP/1.1 + 至少 TLS1.2 是这类问题最有效的绕法。
+    if (stage == TlsStage::LegacyHttp11)
+    {
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, static_cast<long>(CURL_HTTP_VERSION_1_1));
+#if LIBCURL_VERSION_NUM >= 0x073400
+        curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2));
+#else
+        curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1));
+#endif
     }
 }
 
@@ -564,11 +620,15 @@ void Downloader::run()
 
     CURLcode rc = CURLE_OK;
 
-    // 第一次带证书校验；如果设备上没有可用的证书链导致失败，
-    // 再降级重试一次，并在 UI 上明确提示「未校验证书」。
-    for (int attempt = 0; attempt < 2; attempt++)
+    // 最多三档：① 校验证书 → ② 不校验证书 → ③ 不校验 + HTTP/1.1 + TLS1.2。
+    // 每一档失败且错误属于「SSL 类」时，删掉半成品再降一档重试。
+    // 真机实测：国内网盘（证书链不全）在第 ② 档就通；Steam 的 CDN 要到第 ③ 档。
+    static const TlsStage STAGES[] = { TlsStage::Verify, TlsStage::NoVerify, TlsStage::LegacyHttp11 };
+    constexpr int STAGE_COUNT      = static_cast<int>(sizeof(STAGES) / sizeof(STAGES[0]));
+
+    for (int attempt = 0; attempt < STAGE_COUNT; attempt++)
     {
-        const bool verify = (attempt == 0);
+        const TlsStage stage = STAGES[attempt];
 
         Transfer ctx;
         ctx.curl = curl;
@@ -577,12 +637,13 @@ void Downloader::run()
         prog->percent.store(0);
         prog->cancelRequested.store(false);
 
-        applyOptions(curl, &ctx, prog->url, caBundle, verify);
+        applyOptions(curl, &ctx, prog->url, caBundle, stage);
 
         rc = curl_easy_perform(curl);
 
-        logx::linef("curl_easy_perform(第%d次, 校验证书=%d) = %d (%s)，落盘 %lld 字节 / 内存 %u 字节",
-            attempt + 1, verify ? 1 : 0, static_cast<int>(rc), curl_easy_strerror(rc),
+        logx::linef("curl_easy_perform(第%d/%d次, %s) = %d (%s)，落盘 %lld 字节 / 内存 %u 字节",
+            attempt + 1, STAGE_COUNT, tlsStageName(stage),
+            static_cast<int>(rc), curl_easy_strerror(rc),
             static_cast<long long>(ctx.offset), static_cast<unsigned>(ctx.body.size()));
 
         if (ctx.fileOpen)
@@ -601,7 +662,7 @@ void Downloader::run()
 
         if (rc == CURLE_OK)
         {
-            prog->tlsVerified.store(verify);
+            prog->tlsVerified.store(stage == TlsStage::Verify);
 
             // 尺寸校验：服务器声明了长度就必须完全一致。
             // 内存模式不适用 —— offset 恒为 0，而且可能被主动截断。
@@ -617,10 +678,18 @@ void Downloader::run()
             break;
         }
 
-        if (prog->cancelRequested.load() || ctx.writeError || !verify || !isCertError(rc))
+        // 用户取消 / 写盘失败 / 错误不属于 SSL 类 → 不再折腾
+        if (prog->cancelRequested.load() || ctx.writeError || !isSslRetryable(rc))
             break;
 
-        // 证书问题：删掉半成品，换成「不校验证书」再试一次
+        // 已经是最后一档 → 结束
+        if (attempt + 1 >= STAGE_COUNT)
+            break;
+
+        logx::linef("降档重试：%s → %s（原因：%s）",
+            tlsStageName(stage), tlsStageName(STAGES[attempt + 1]), curl_easy_strerror(rc));
+
+        // 删掉半成品，并清掉这一轮定下的文件名，让下一轮重新来
         std::string partial = currentOutputPath(prog.get());
         if (!partial.empty())
             fsx::removeFile(partial);

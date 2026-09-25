@@ -13,7 +13,8 @@
         图片：……                  ← url.txt 里 img: 的加载情况
         [ 图片 1 ]  [ 图片 2 ] ……  ← 固定高度的图片位（不可聚焦）
         下载保存到：sdmc:/（第二行的文件夹图标可更换）
-        [ 诊断信息与提示 ]         ← 底部锚点：可聚焦，保证能滚到最底
+        [ 诊断信息…（点开后就地展开下面两段）]  ← 底部锚点：可聚焦，保证能滚到最底
+        （展开后）环境 / 路径 / 图片加载结果
       └─────────────────────────────────────────────────────────┘
 
     交互：
@@ -27,7 +28,9 @@
       1) 工作线程运行期间/收尾时**绝不改动视图栈**：不用 Dialog、不发通知、
          不在任务回调里 pushView/popView；进度与结果只通过改 Label 文本体现。
          （v2.0.0/v2.1.x 那种「动画回调里 pushView」的写法正是真机冻死的元凶。）
-         唯一的例外是**按键触发**的常规路径：点图标开选择器、点「诊断信息」翻开详情页。
+         唯一的例外是**按键触发**的常规路径：点图标开文件 / 目录选择器。
+         （「诊断信息」自 v2.7.0 起也改成在主页面就地展开，不再新建页面 ——
+           真机实测点它会直接报错退出，而就地展开是图片位已验证的机制。）
       2) 页面最底部必须留一个**可聚焦**的控件。borealis 的 List 只会「滚动到当前焦点」，
          底部如果没有可聚焦项，再往下就永远滚不动（实测就是「底部内容看不全」）。
 */
@@ -98,7 +101,14 @@ class MainView : public brls::List
 
     void openTextFilePicker(bool forUpdate);
     void openOutputDirPicker();
-    void openDetailsView();
+
+    /// 展开 / 收起底部的诊断信息。
+    ///
+    /// ★ v2.7.0 起**不再 pushView 新页面**（旧版点它会直接报错退出）：
+    ///   诊断正文改用主页面已有的 Label 就地展开/收起 —— expand/collapse
+    ///   是图片位一直在用、已验证的机制，不涉及视图栈、不新建视图树。
+    ///   正文控制在几百字节并拆成两段，避免任何超长文本。
+    void toggleDiagnostics();
 
     void startUpdateCheck();
     void startDownload();
@@ -158,6 +168,14 @@ class MainView : public brls::List
     brls::Label* dirLabel           = nullptr;
     brls::Button* detailsButton     = nullptr;
     brls::RepeatingTask* pollTask   = nullptr;
+
+    //-------- 就地展开的诊断信息（默认收起，点击底部的按钮才展开）--------//
+    brls::Label* diagLabel        = nullptr; // 第 1 段：环境 / 路径 / 上次返回内容
+    brls::Label* diagImagesLabel  = nullptr; // 第 2 段：每张图片的加载结果
+    std::string  diagText;                   // 第 1 段的文本（首次展开时才生成）
+    std::string  diagImagesText;             // 第 2 段的文本
+    bool         diagReady = false;          // 文本是否已生成
+    bool         diagOpen  = false;          // 当前是否处于展开状态
 
     std::vector<ImageSlot> imageSlots;
     /// 正在下载的图片下标（-1 = 没有）

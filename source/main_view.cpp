@@ -55,8 +55,9 @@ constexpr size_t MAX_IMAGE_PIXELS_APPLET = 6u * 1024u * 1024u;
 /// 图片圆角
 constexpr float IMAGE_CORNER_RADIUS = 8.0f;
 
-/// 诊断页里最多显示多少字节的返回内容
-constexpr size_t MAX_DETAIL_BYTES = 6000;
+// （v2.7.0 起诊断信息改为「就地展开」，两段加起来只有几百字节；
+//   不再有「诊断页里塞 6000 字节返回内容」这种做法 ——
+//   完整返回内容在 update_result.txt，完整过程在 log.txt。）
 
 unsigned listItemHeight()
 {
@@ -606,51 +607,18 @@ class CancelButton : public Button
 };
 
 //=====================================================================
-// 诊断信息页（按键触发才 pushView，属于允许的常规路径）
+// 诊断信息（v2.7.0 起改为「就地展开」，不再 pushView 新页面）
+//
+// 真机反馈：点「诊断信息与提示」会直接报错退出（不是死机）。
+// 那个版本是新建一个 DetailsView（List 子树）再 pushView，
+// 里面一次性塞了 5 个 Label，其中一段是 update_result.txt 的前 6000 字节。
+//
+// 与其继续猜是哪一层出的问题，不如**整条路去掉**：
+//   * 诊断文本直接用**主页面已有的 Label** 就地展开/收起
+//     （expand/collapse 是图片位一直在用、已验证的机制）；
+//   * 文本量压到几百字节，并拆成两段，避免任何超长 Label；
+//   * 构造/展开每一步都写 [UI] 面包屑，万一还出问题，log.txt 的最后一行就指明位置。
 //=====================================================================
-class DetailsView : public List
-{
-  public:
-    DetailsView(const std::string& imageSummary, const std::string& imageDetail)
-        : List()
-    {
-        this->registerAction("返回", Key::B, [] {
-            Application::popView();
-            return true;
-        });
-
-        this->addView(new Header("诊断信息与提示", true, "按 B 返回"));
-
-        this->addView(new Label(LabelStyle::DESCRIPTION,
-            "操作：A 输入链接 · X 读取 url.txt · 文件图标选 .txt · 文件夹图标选保存目录 · "
-            "十字键/左摇杆 移动 · + 退出\n"
-            "下载会覆盖同名文件；进度、结果与错误都显示在主页面里，不再弹窗。",
-            true));
-
-        this->addView(new Label(LabelStyle::DESCRIPTION,
-            "运行环境：" + netx::describe() + "\n"
-            "日志文件：" + std::string(appcfg::LOG_FILE) + "\n"
-            "项目目录：" + std::string(appcfg::PROJECT_DIR) + "\n"
-            "图片缓存：" + std::string(appcfg::IMG_DIR),
-            true));
-
-        this->addView(new Label(LabelStyle::DESCRIPTION, imageSummary + "\n" + imageDetail, true));
-
-        // 上次检查更新的完整返回内容
-        std::string result;
-        if (fsx::readWholeFile(appcfg::RESULT_FILE, &result) && !result.empty())
-        {
-            this->addView(new Label(LabelStyle::DESCRIPTION,
-                "上次检查更新的完整返回内容（" + fsx::formatBytes(static_cast<s64>(result.size())) + "）：", true));
-            this->addView(new Label(LabelStyle::DESCRIPTION, capText(result, MAX_DETAIL_BYTES), true));
-        }
-        else
-        {
-            this->addView(new Label(LabelStyle::DESCRIPTION,
-                "还没有检查更新的记录（在主页面第一行点「访问」试一次）。", true));
-        }
-    }
-};
 
 //=====================================================================
 // 轮询任务：把工作线程的状态搬到界面上
@@ -898,12 +866,24 @@ void MainView::buildFooter(const std::string& startupNotice)
     // ★ 底部锚点：borealis 的 List 只会「滚动到当前焦点」，页面最底下如果
     //   没有可聚焦的控件，再往下就永远滚不动（实测就是「底部内容看不全」）。
     //   这个按钮既是有用的入口，也顺手把滚动范围撑到底。
+    //
+    //   ★ 诊断正文（两段，都很短）挂在按钮**上方**：
+    //     List 的滚动永远以「当前焦点」为准，焦点就在这个按钮上，
+    //     所以正文放在按钮上面才一定看得见；放在下面会被屏幕裁掉。
     //-----------------------------------------------------------------
+    this->diagLabel = new Label(LabelStyle::DESCRIPTION, "", true);
+    this->diagLabel->collapse(false); // 默认收起：不占位、不可见
+    this->addView(this->diagLabel);
+
+    this->diagImagesLabel = new Label(LabelStyle::DESCRIPTION, "", true);
+    this->diagImagesLabel->collapse(false);
+    this->addView(this->diagImagesLabel);
+
     this->detailsButton = new Button(ButtonStyle::REGULAR);
-    this->detailsButton->setLabel("诊断信息与提示");
+    this->detailsButton->setLabel("诊断信息与提示（A 展开 / 收起）");
     this->detailsButton->setHeight(listItemHeight());
     this->detailsButton->getClickEvent()->subscribe([this](View*) {
-        this->openDetailsView();
+        this->toggleDiagnostics();
     });
     this->addView(this->detailsButton);
 }
@@ -1279,42 +1259,93 @@ void MainView::openOutputDirPicker()
     Application::pushView(picker);
 }
 
-void MainView::openDetailsView()
+void MainView::toggleDiagnostics()
 {
-    std::string summary = "图片：未配置";
-    std::string detail  = "（在 " + std::string(appcfg::URL_FILE) +
-                          " 里用 img: 写图片链接或文件名，逗号分隔；重启程序后生效）";
+    if (this->diagLabel == nullptr || this->diagImagesLabel == nullptr)
+        return;
 
-    if (!this->imageSlots.empty())
+    //============================= 收起 =============================//
+    if (this->diagOpen)
     {
-        summary = "图片：" + std::to_string(this->imagesLoaded) + "/" +
-                  std::to_string(this->imageSlots.size()) + " 已加载";
-        if (this->imagesFailed > 0)
-            summary += "，" + std::to_string(this->imagesFailed) + " 张失败";
+        logx::ui("诊断信息：收起");
 
-        summary += "（显存 " + std::to_string(this->imagePixelsUsed / 1000000u) + "M/" +
-                   std::to_string(imagePixelBudget() / 1000000u) + "M 像素）";
+        this->diagLabel->collapse(false);
+        this->diagImagesLabel->collapse(false);
+        this->diagOpen = false;
 
-        detail.clear();
-        for (size_t i = 0; i < this->imageSlots.size(); i++)
-        {
-            const ImageSlot& slot = this->imageSlots[i];
-
-            detail += std::to_string(i + 1) + ". " + slot.item + "\n";
-            if (slot.loaded)
-                detail += "   → 已加载：" + slot.cached + "\n";
-            else
-                detail += "   → 未加载" + (slot.note.empty() ? "" : "：" + slot.note) + "\n";
-        }
+        this->invalidate();
+        return;
     }
 
-    if (logx::writeFailed())
-        detail += "\n⚠ 日志写入失败（SD 卡），log.txt 可能不完整。\n";
+    //============================= 展开 =============================//
+    // ★ 文本刻意压得很短（两段加起来几百字节），而且到点按钮这一刻才生成。
+    //   主界面单帧要排版的文本越少越不容易出问题；完整信息永远在文件里：
+    //   log.txt（全过程诊断）+ update_result.txt（上次返回内容）。
+    if (!this->diagReady)
+    {
+        logx::ui("诊断信息：构建文本");
 
-    if (!this->startupNotice.empty())
-        detail += "\n启动提示：\n" + this->startupNotice;
+        std::string info;
+        info += "环境：" + netx::describe() + "\n";
+        info += "目录：" + std::string(appcfg::PROJECT_DIR) + "\n";
+        info += "详细日志与返回内容：同目录的 log.txt / update_result.txt\n";
 
-    Application::pushView(new DetailsView(summary, detail));
+        std::string result;
+        if (fsx::readWholeFile(appcfg::RESULT_FILE, &result) && !result.empty())
+            info += "上次返回内容：" + fsx::formatBytes(static_cast<s64>(result.size())) + "\n";
+        else
+            info += "上次返回内容：还没有记录\n";
+
+        if (logx::writeFailed())
+            info += "⚠ 日志写入失败（SD 卡），log.txt 可能不完整\n";
+
+        if (!this->startupNotice.empty())
+            info += "启动提示：" + this->startupNotice + "\n";
+
+        this->diagText = info;
+        logx::uif("诊断信息：环境段 %u 字节", static_cast<unsigned>(info.size()));
+
+        std::string images;
+
+        if (this->imageSlots.empty())
+        {
+            images = "图片：未配置（在 url.txt 里用 img: 指定）";
+        }
+        else
+        {
+            images = "图片：" + std::to_string(this->imagesLoaded) + "/" +
+                     std::to_string(this->imageSlots.size()) + " 已加载，显存 " +
+                     std::to_string(this->imagePixelsUsed / 1000000u) + "M/" +
+                     std::to_string(imagePixelBudget() / 1000000u) + "M 像素\n";
+
+            for (size_t i = 0; i < this->imageSlots.size(); i++)
+            {
+                const ImageSlot& slot = this->imageSlots[i];
+
+                images += std::to_string(i + 1) + ".";
+                images += slot.loaded
+                              ? std::string(" 已加载")
+                              : (std::string(" 失败：") + (slot.note.empty() ? "原因未知" : slot.note));
+                images += "\n";
+            }
+        }
+
+        this->diagImagesText = images;
+        logx::uif("诊断信息：图片段 %u 字节", static_cast<unsigned>(images.size()));
+
+        this->diagReady = true;
+    }
+
+    logx::ui("诊断信息：展开");
+    this->diagLabel->setText(this->diagText);
+    this->diagLabel->expand(false);
+    this->diagImagesLabel->setText(this->diagImagesText);
+    this->diagImagesLabel->expand(false);
+
+    this->diagOpen = true;
+    this->invalidate();
+
+    logx::ui("诊断信息：展开完成");
 }
 
 void MainView::setOutputDir(const std::string& path, bool persist)
