@@ -185,6 +185,9 @@ class MainView : public brls::List
     int imagesLoaded = 0;
     int imagesFailed = 0;
 
+    /// 这一批图片已经处理了多少格（保险丝，见 finishImageTask）
+    int imageBatchSteps = 0;
+
     /// 已经加载进显存的像素总量（用来看住 Applet 模式下的显存/内存预算）
     size_t imagePixelsUsed = 0;
 

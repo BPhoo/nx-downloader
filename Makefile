@@ -30,7 +30,7 @@ ROMFS		:=	romfs
 
 APP_TITLE	:=	NX Downloader
 APP_AUTHOR	:=	xtgxiso
-APP_VERSION	:=	2.7.2
+APP_VERSION	:=	2.7.3
 
 # 图标（jpg）。删掉 icon.jpg 时请同时设置 NO_ICON := 1，否则 elf2nro 会报错
 ICON		:=	icon.jpg

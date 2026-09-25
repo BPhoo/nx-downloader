@@ -1659,6 +1659,33 @@ void MainView::finishImageTask(Downloader::State state)
 
     logx::uif("图片下载收尾：index=%d state=%d", index, static_cast<int>(state));
 
+    // ★★ 无论成败，这一格都算「已经处理过」，必须**立刻**清掉 pending。
+    //    否则 startNextPendingImage() 下一轮又会挑中同一张：
+    //    失败 → 再下载 → 再失败 … 停不下来。
+    //    v2.7.2 真机上就是这么把 log.txt 一路刷到写满上限的（整份日志
+    //    全是同一张图的重复记录，真正有用的信息一点没留下）。
+    if (index >= 0 && static_cast<size_t>(index) < this->imageSlots.size())
+        this->imageSlots[static_cast<size_t>(index)].pending = false;
+
+    // ★★ 保险丝：整批处理次数超过「格数 × 2 + 2」就强制收尾。
+    //    逻辑上有了上面的 pending 清理就不会循环，但死循环的代价太大，加一道闸。
+    this->imageBatchSteps++;
+    const int stepLimit = static_cast<int>(this->imageSlots.size()) * 2 + 2;
+
+    if (this->imageBatchSteps > stepLimit)
+    {
+        logx::uif("图片批量步数超过上限（%d），强制收尾", stepLimit);
+
+        this->task = Task::None;
+        this->setButtonsEnabled(true);
+        this->setCancelEnabled(false);
+        this->setProgress(100);
+        this->setStatus("图片批量已中止（尝试次数过多）");
+        this->setDetail("已加载 " + std::to_string(this->imagesLoaded) + " 张。" +
+                        "改 " + std::string(appcfg::URL_FILE) + " 里的 img: 后重启可重试。");
+        return;
+    }
+
     if (state == Downloader::State::Finished && index >= 0)
     {
         const std::string path = this->downloader->outputPath();
@@ -1695,6 +1722,15 @@ void MainView::finishImageTask(Downloader::State state)
     }
 
     this->refreshImageSummary();
+
+    // ★ 已经失败 2 张 → 剩下的不再试。
+    //   同一批图多半是同一类问题（同一个域名、同一种网络条件），
+    //   继续给每张跑满四档只会让用户干等；失败的详细原因在诊断区逐张列出。
+    if (this->imagesFailed >= 2)
+    {
+        for (ImageSlot& slot : this->imageSlots)
+            slot.pending = false;
+    }
 
     // 用户取消 → 整个批量就此收住，别继续下一张
     if (state == Downloader::State::Cancelled)
