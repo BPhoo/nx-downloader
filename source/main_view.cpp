@@ -690,7 +690,8 @@ class PollTask : public RepeatingTask
 // MainView
 //=====================================================================
 
-MainView::MainView(Downloader* downloader, const std::string& startupNotice)
+MainView::MainView(Downloader* downloader, const std::string& startupNotice,
+    const appcfg::UrlEntry& urlEntry, const std::string& settingsText)
     : List()
     , downloader(downloader)
 {
@@ -699,9 +700,14 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     // 真机崩溃时，日志的**最后一行**就指明了死在哪一步 ——
     // 上一版构造函数里一行日志都没有，日志停在 pushView 之前，
     // 完全看不出是构造的哪一段出的问题（只能靠猜，代价是一轮一轮试）。
+    //
+    // ★★ 构造函数里**不做任何 SD 卡访问**：
+    //    url.txt / settings.txt 的内容由 main.cpp 提前读好传进来（读在这里也一样要花 I/O，
+    //    但这样构造函数就变成纯 CPU；真机崩溃点正好在「一次 SD 写盘之后」，
+    //    先把 SD 访问从这段区间里彻底拿掉）。
     //-----------------------------------------------------------------
-    logx::ui("构造：读设置");
-    this->readSettings();
+    logx::ui("构造：解析设置");
+    this->readSettings(settingsText);
 
     if (!this->savedDir.empty())
         this->outputDir = fsx::normalize(this->savedDir);
@@ -716,7 +722,7 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     this->buildStatusArea();
 
     logx::ui("构造：图片位");
-    this->buildGallery();
+    this->buildGallery(urlEntry.images);
 
     logx::ui("构造：底部");
     this->buildFooter(startupNotice);
@@ -728,10 +734,12 @@ MainView::MainView(Downloader* downloader, const std::string& startupNotice)
     if (!this->savedUpdate.empty() || !this->savedDownload.empty())
     {
         logx::ui("构造：恢复上次的链接");
+        this->applyingSaved = true;
         if (!this->savedUpdate.empty())
             this->updateRow->input->setText(appcfg::normalizeUrl(this->savedUpdate));
         if (!this->savedDownload.empty())
             this->downloadRow->input->setText(appcfg::normalizeUrl(this->savedDownload));
+        this->applyingSaved = false;
     }
 
     logx::ui("构造：轮询任务");
@@ -807,14 +815,19 @@ void MainView::buildRows()
 
 void MainView::buildStatusArea()
 {
+    // 这一层面包屑是「按控件」打的：真机崩溃点曾经落在这个函数里，
+    // 只有把每一步都写下来，才能一次定位到具体是哪个控件/调用。
+    logx::ui("状态区：状态 Label");
     this->statusLabel = new Label(LabelStyle::REGULAR, "状态：就绪", false);
     this->shownStatus = "就绪";
     this->addView(this->statusLabel);
 
+    logx::ui("状态区：进度条");
     this->bar = new ProgressDisplay(ProgressDisplayFlags::PERCENTAGE);
     this->bar->setHeight(60);
     this->addView(this->bar);
 
+    logx::ui("状态区：取消按钮");
     CancelButton* cancel = new CancelButton();
     cancel->getClickEvent()->subscribe([this](View*) {
         if (this->downloader == nullptr)
@@ -828,24 +841,19 @@ void MainView::buildStatusArea()
     this->cancelButton = cancel;
     this->addView(cancel);
 
+    logx::ui("状态区：详情 Label");
     this->detailLabel = new Label(LabelStyle::DESCRIPTION,
         "（这里会显示检查更新的返回内容、以及错误详情）", true);
     this->shownDetail = "（这里会显示检查更新的返回内容、以及错误详情）";
     this->addView(this->detailLabel);
+
+    logx::ui("状态区：完成");
 }
 
-void MainView::buildGallery()
+void MainView::buildGallery(const std::vector<std::string>& configured)
 {
-    // 从 url.txt 里取 img: 列表
-    std::vector<std::string> items;
-
-    std::string urlText;
-    if (fsx::readWholeFile(appcfg::URL_FILE, &urlText))
-    {
-        appcfg::UrlEntry entry;
-        appcfg::parseUrlFile(urlText, &entry);
-        items = entry.images;
-    }
+    // img: 列表由 main.cpp 提前从 url.txt 解析好传进来 —— 这里**不读 SD 卡**
+    std::vector<std::string> items = configured;
 
     if (items.size() > MAX_IMAGES)
     {
@@ -1223,12 +1231,12 @@ void MainView::showStartupNotice()
 
     this->noticeShown = true;
 
-    // 首帧已经画出来了，这时候才补按钮图标（构造函数里不碰 GPU，见 InputRow 的说明）
+    // 主循环已经跑起来了，这时候才补按钮图标（构造函数里不碰 GPU，见 InputRow 的说明）
     if (this->updateRow != nullptr)
         this->updateRow->loadIcons();
     if (this->downloadRow != nullptr)
         this->downloadRow->loadIcons();
-    logx::ui("首帧之后：按钮图标已补上（GL 纹理创建正常）");
+    logx::ui("主循环第一轮：按钮图标已补上（GL 纹理创建正常）");
 
     // 日志写不进去时**必须在屏幕上说出来**：
     // 否则日志会静静地停在上一次成功的那一行，看起来像「程序死在这一步」。
@@ -1547,14 +1555,17 @@ void MainView::onPoll()
 
     this->aliveTicks++;
 
-    // 前几次轮询写进日志：这是「渲染循环确实活着」最直接的证据。
-    // 真机崩溃时，日志里有没有这几行，能立刻区分「主循环没跑起来」和「跑起来之后才出事」。
-    if (this->aliveTicks <= 5)
-        logx::uif("轮询第 %d 次（主循环正常）", this->aliveTicks);
-
-    // 第一次轮询 ≈ 第一帧之后：这时候才动界面文案 / 读 url.txt / 碰图片
+    // 第一次轮询 ≈ 界面已经进入主循环：这时候才动界面文案 / 碰图片
     if (this->aliveTicks == 1)
         this->showStartupNotice();
+
+    // 前 6 次轮询把 applet 状态写进日志：这既是「渲染循环确实活着」的证据，
+    // 也记录了**卡死前的焦点状态** —— Applet 模式失焦时系统会接管 SD 卡 / 显示，
+    // 此时做 SD 读写最容易互相干扰，是这类「整机死机」问题的关键判据。
+    if (this->aliveTicks <= 6)
+        logx::uif("轮询第 %d 次：主循环正常，%s", this->aliveTicks, netx::appletStateText().c_str());
+    else if (this->aliveTicks == 7)
+        logx::ui("（之后不再逐次记录轮询）");
 
     // 图片加载刻意推迟到第 3 次轮询（约 300ms）：那时界面已经稳稳画了几帧，
     // 万一图片这条路上有问题，日志能明确区分「界面还没起来」和「界面起来后碰图片才出事」。
@@ -1795,15 +1806,18 @@ void MainView::finishTask(Downloader::State state)
 
 //------------------------------ 设置持久化 ------------------------------//
 
-void MainView::readSettings()
+void MainView::readSettings(const std::string& text)
 {
     this->savedUpdate.clear();
     this->savedDownload.clear();
     this->savedDir.clear();
 
-    std::string text;
-    if (!fsx::readWholeFile(appcfg::SETTINGS_FILE, &text))
+    // 内容由 main.cpp 读好传进来（构造函数里不碰 SD 卡，原因见构造函数顶部注释）
+    if (text.empty())
         return;
+
+    // 记下原文：只要界面里没改动，saveSettings() 就不会再写一次盘
+    this->lastSavedText = text;
 
     const auto takeValue = [](const std::string& entry, const char* key, std::string* out) {
         const size_t length = std::strlen(key);
@@ -1835,14 +1849,24 @@ void MainView::saveSettings() const
     if (this->updateRow == nullptr || this->downloadRow == nullptr)
         return;
 
+    // 启动时把上次保存的值填回输入框会触发 onChange → 这里被调用。
+    // 内容其实没变，白写一次 SD 卡没有任何意义（Applet 模式下 SD I/O 越少越安全）。
+    if (this->applyingSaved)
+        return;
+
     std::string data;
     data += "# NX Downloader 设置（界面里改过之后会自动写回这里）\n";
     data += "update=" + this->updateRow->input->text() + "\n";
     data += "download=" + this->downloadRow->input->text() + "\n";
     data += "dir=" + this->outputDir + "\n";
 
+    // 与上次写出去的内容一致就不写（避免无意义的 SD 写入）
+    if (data == this->lastSavedText)
+        return;
+
     if (!fsx::ensureDirectory(appcfg::PROJECT_DIR))
         return;
 
-    fsx::writeWholeFile(appcfg::SETTINGS_FILE, data);
+    if (fsx::writeWholeFile(appcfg::SETTINGS_FILE, data))
+        this->lastSavedText = data;
 }

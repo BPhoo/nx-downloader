@@ -13,9 +13,12 @@ namespace logx
 namespace
 {
 
-/// 日志上限。超过就丢掉前半段（而不是停止记录）：
-/// 出问题时最有价值的是最后几行，静默停止会让诊断反而失效。
-constexpr size_t MAX_LOG_BYTES = 24 * 1024;
+/// 日志文件上限。超过就**轮转**一次（关掉重开、只保留最近一部分），
+/// 既不无限增长，也不会静默停止记录 —— 出问题时最有价值的是最后几行。
+constexpr size_t MAX_LOG_BYTES = 64 * 1024;
+
+/// 轮转时保留尾部多少字节
+constexpr size_t KEEP_ON_ROTATE = 8 * 1024;
 
 // UI 线程和下载工作线程都会写日志。
 // libnx 的 IPC 会话不是并发安全的，而且内存里的缓冲区是 std::string ——
@@ -28,6 +31,97 @@ int g_sequence = 0;
 
 /// 最近一次写盘是否失败（见 logx::writeFailed 的说明）
 bool g_writeFailed = false;
+
+//----------------------------------------------------------------------
+// ★ 常驻打开的日志文件句柄 + 当前写入偏移。
+//
+//   为什么不再用 `writeWholeFile`（每次整份重写）：
+//   那条路每写一行要「删文件 → 建文件 → 打开 → 写 → flush → 关」共 6 次 FS 操作，
+//   启动阶段二十多行日志就会对 SD 卡打出上百次操作。而 Applet 模式（从相册启动）下
+//   SD 卡是与父 applet / 系统共用的，这么打很可能把整机拖死（真机实测：日志停在
+//   构造函数中间，屏幕卡住不动）。
+//   改成「启动时打开一次，之后逐行追加」后，每行只剩 **1 次** 写操作。
+//----------------------------------------------------------------------
+FsFile g_file = {};
+bool g_fileOpen = false;
+s64 g_offset = 0;
+
+/// 追加一段字节到日志文件（调用者必须已持 g_mutex）
+bool writeBytesLocked(const char* data, size_t size)
+{
+    if (!g_fileOpen || size == 0)
+        return false;
+
+    // flush=true：真正落盘。宁可慢一点，也要保证崩溃/死机时最后一行在盘上。
+    const Result rc = fsx::writeFileChunk(&g_file, g_offset, data, size, true);
+    if (R_FAILED(rc))
+        return false;
+
+    g_offset += static_cast<s64>(size);
+    return true;
+}
+
+/// 轮转：关掉重开，只保留最近一部分（调用者必须已持 g_mutex）
+void rotateLocked()
+{
+    if (g_fileOpen)
+    {
+        fsx::flushAndCloseFile(&g_file);
+        g_fileOpen = false;
+    }
+
+    std::string tail = (g_buffer.size() > KEEP_ON_ROTATE)
+                           ? g_buffer.substr(g_buffer.size() - KEEP_ON_ROTATE)
+                           : g_buffer;
+
+    g_buffer = "===== 日志过长，已保留最近部分（序号 " + std::to_string(g_sequence) + " 之后继续）=====\n" + tail;
+
+    if (fsx::openForAppend(appcfg::LOG_FILE, &g_file, &g_offset))
+    {
+        g_fileOpen = true;
+        writeBytesLocked(g_buffer.data(), g_buffer.size());
+    }
+}
+
+/// 真正追加一行（调用者必须已持 g_mutex）
+void appendLineLocked(const std::string& text)
+{
+    if (!g_enabled)
+        return;
+
+    if (g_buffer.size() + text.size() + 32 > MAX_LOG_BYTES)
+        rotateLocked();
+
+    char prefix[16];
+    std::snprintf(prefix, sizeof(prefix), "[%03d] ", ++g_sequence);
+
+    std::string entry(prefix);
+    entry += text;
+    entry += '\n';
+
+    g_buffer += entry;
+
+    if (writeBytesLocked(entry.data(), entry.size()))
+    {
+        if (g_writeFailed)
+        {
+            g_writeFailed             = false;
+            const std::string notice  = "[!] 日志写入已恢复（之前有内容丢失）\n";
+            g_buffer += notice;
+            writeBytesLocked(notice.data(), notice.size());
+        }
+        return;
+    }
+
+    // 写不进去：只标记一次（界面会显示）。
+    // 这一行只留在内存里 —— 只要后续某次写成功，它也会一起落盘，
+    // 于是「日志为什么变短」在日志里也有答案。
+    if (!g_writeFailed)
+    {
+        g_writeFailed            = true;
+        g_buffer += "[!] 日志写入 SD 卡失败：以上内容之后的日志可能都没能落盘\n";
+    }
+}
 
 } // namespace
 
@@ -59,44 +153,7 @@ void line(const std::string& text)
         return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (g_buffer.size() >= MAX_LOG_BYTES)
-    {
-        // 只保留最近的：清空并留一行说明
-        char mark[96];
-        std::snprintf(mark, sizeof(mark), "===== 前文过长已丢弃（序号 %d 之后继续）=====\n", g_sequence);
-        g_buffer.assign(mark);
-    }
-
-    char prefix[16];
-    std::snprintf(prefix, sizeof(prefix), "[%03d] ", ++g_sequence);
-
-    g_buffer += prefix;
-    g_buffer += text;
-    g_buffer += '\n';
-
-    // 整份重写：崩溃/死机时最后一行也已经在盘上
-    const bool ok = fsx::writeWholeFile(appcfg::LOG_FILE, g_buffer);
-
-    if (!ok)
-    {
-        // 写不进去就标记出来（界面会显示）。
-        // 内部缓冲区**故意不同步**：只要后续某次写成功，恢复说明这一行也会一起落盘，
-        // 于是「日志为什么变短」在日志里也有答案。
-        if (!g_writeFailed)
-        {
-            g_writeFailed = true;
-            g_buffer += "[!] 日志写入 SD 卡失败：以下内容可能都没能落盘\n";
-        }
-        return;
-    }
-
-    if (g_writeFailed)
-    {
-        g_writeFailed = false;
-        g_buffer += "[!] 日志写入已恢复（之前有内容丢失）\n";
-        fsx::writeWholeFile(appcfg::LOG_FILE, g_buffer);
-    }
+    appendLineLocked(text);
 }
 
 void linef(const char* format, ...)
@@ -134,15 +191,39 @@ void uif(const char* format, ...)
 
 void open()
 {
-    g_buffer.clear();
-    g_sequence = 0;
-    g_enabled  = fsx::isDirectory(appcfg::PROJECT_DIR) || fsx::ensureDirectory(appcfg::PROJECT_DIR);
+    std::lock_guard<std::mutex> lock(g_mutex);
 
-    if (!g_enabled)
+    g_buffer.clear();
+    g_sequence    = 0;
+    g_writeFailed = false;
+    g_offset      = 0;
+
+    const bool dirOk = fsx::isDirectory(appcfg::PROJECT_DIR) || fsx::ensureDirectory(appcfg::PROJECT_DIR);
+    if (!dirOk)
         return;
 
-    line("===== NX Downloader 启动日志 =====");
-    linef("固件/环境: appletType=%d", static_cast<int>(appletGetAppletType()));
+    // 打开（并清空）日志文件，之后一直复用这个句柄逐行追加
+    if (!fsx::openForAppend(appcfg::LOG_FILE, &g_file, &g_offset))
+        return;
+
+    g_fileOpen = true;
+    g_enabled  = true;
+
+    appendLineLocked("===== NX Downloader 启动日志 =====");
+    appendLineLocked("固件/环境: appletType=" + std::to_string(static_cast<int>(appletGetAppletType())));
+}
+
+void close()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (g_fileOpen)
+    {
+        fsx::flushAndCloseFile(&g_file);
+        g_fileOpen = false;
+    }
+
+    g_enabled = false;
 }
 
 } // namespace logx

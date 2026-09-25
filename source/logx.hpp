@@ -32,7 +32,15 @@ const char* path();
 bool enabled();
 
 /// 重建日志文件并写启动横幅
+///
+/// 实现要点：**打开一次、之后逐行追加**（见 fsx::openForAppend）。
+/// 早期实现是「每写一行整份重写文件」，每行要删+建+开+写+flush+关共 6 次 FS 操作，
+/// 启动阶段就会对 SD 卡打出上百次操作 —— Applet 模式下 SD 卡是与系统共用的，
+/// 真机上表现为整机死机。现在每行只剩 1 次写操作。
 void open();
+
+/// 冲刷并关闭日志文件（退出前调用）
+void close();
 
 /// 追加一行（立刻落盘）
 void line(const std::string& text);

@@ -57,10 +57,20 @@ bool createAndOpenFile(const std::string& sdmcPath, FsFile* out, s64 preallocSiz
 //----------------------------------------------------------------------
 
 /// 在已打开的文件上写一段数据（内部串行化）。返回 libnx Result，0 = 成功。
-Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size);
+/// flush=true 时带上 `FsWriteOption_Flush`（真正落盘，慢但抗死机）。
+Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size, bool flush = false);
 
 /// 冲刷并关闭文件（同样串行化）
 void flushAndCloseFile(FsFile* file);
+
+/// 追加写用的打开方式：**创建（已存在则清空）并保持句柄打开**，
+/// 之后用 writeFileChunk 按 offset 递增追加。
+///
+/// 为什么要这样：`writeWholeFile` 每写一次都要「删文件 + 建文件 + 打开 + 写 + flush + 关」，
+/// 日志这种「一秒写好几行」的场景会在启动瞬间对 SD 卡打出上百次 FS 操作。
+/// Applet 模式下 SD 卡是与父 applet / 系统共用的，这么打很容易出问题
+/// （真机现象是整机死机）。改成「一次打开、逐行追加」后，每行只剩 1 次写操作。
+bool openForAppend(const std::string& sdmcPath, FsFile* out, s64* outOffset = nullptr);
 
 /// 列出某个目录下的子目录名（不含文件），按名称排序
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names);

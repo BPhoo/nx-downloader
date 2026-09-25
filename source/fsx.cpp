@@ -52,15 +52,13 @@ bool init()
     g_sd     = fs;
     g_opened = true;
 
-    // 顺便把 "sdmc:" 挂到 devoptab 上。
-    //
-    // 为什么需要它：本程序自己的读写都走上面的 FsFileSystem 裸接口（更可控，
-    // 也不会因为 hbmenu 已挂载过 sdmc 而失败），但**第三方库**（比如 borealis /
-    // nanovg 读图片文件、stb_image 里面的 fopen）走的是 stdio —— 没有 devoptab
-    // 它们一律 fopen 失败。真机/模拟器上「图片已加载却什么都不显示」就是这么来的：
-    // nvgCreateImage 内部 fopen 失败 → 返回纹理 0 → 画出来是一片空白。
-    // 挂载本身很轻（就是多开一个 SD 卡会话），失败也不影响已有功能。
-    fsdevMountSdmc();
+    // ⚠️ 这里**不要**再挂 `fsdevMountSdmc()`。
+    //    它会再开一个 SD 卡会话（多一个 FS client）。
+    //    本程序自己的读写全部走上面的裸 FsFileSystem，第三方库（nanovg/stb）读图片
+    //    也已经改成「自己把字节读出来再解码」，**根本不需要 devoptab**。
+    //    而 Applet 模式（从相册启动）下 SD 卡本来就被父 applet / 系统共用，
+    //    多开一个会话只会增加互相干扰的机会（真机上出现的是整机死机）。
+    //    真需要 stdio 访问 sdmc: 时再单独加，并配合焦点状态判断。
 
     return true;
 }
@@ -249,14 +247,14 @@ bool createAndOpenFile(const std::string& sdmcPath, FsFile* out, s64 preallocSiz
     return true;
 }
 
-Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size)
+Result writeFileChunk(FsFile* file, s64 offset, const void* data, u64 size, bool flush)
 {
     if (file == nullptr || data == nullptr || size == 0)
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
 
     std::lock_guard<std::recursive_mutex> lock(g_ioMutex);
 
-    return fsFileWrite(file, offset, data, size, FsWriteOption_None);
+    return fsFileWrite(file, offset, data, size, flush ? FsWriteOption_Flush : FsWriteOption_None);
 }
 
 void flushAndCloseFile(FsFile* file)
@@ -268,6 +266,19 @@ void flushAndCloseFile(FsFile* file)
 
     fsFileFlush(file);
     fsFileClose(file);
+}
+
+bool openForAppend(const std::string& sdmcPath, FsFile* out, s64* outOffset)
+{
+    // createAndOpenFile 会「先删再建」，也就是每次启动把日志清空重来（我们就是要这样），
+    // 而且它打开的正是 FsOpenMode_Write | FsOpenMode_Append。
+    if (!createAndOpenFile(sdmcPath, out, 0))
+        return false;
+
+    if (outOffset != nullptr)
+        *outOffset = 0;
+
+    return true;
 }
 
 bool listSubDirectories(const std::string& sdmcPath, std::vector<std::string>* names)

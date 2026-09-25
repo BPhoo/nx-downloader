@@ -184,6 +184,34 @@ int main(int argc, char* argv[])
         projectOk ? "OK" : "FAILED", createdDir ? 1 : 0, createdFile ? 1 : 0);
 
     //------------------------------------------------------------------
+    // 5b. 提前读 url.txt / settings.txt
+    //
+    //     ★ 刻意**不**留到主界面的构造函数里读：
+    //       Applet 模式（从相册启动）下 SD 卡是与父 applet / 系统共用的，
+    //       真机日志显示崩溃点正好落在构造函数中间、紧跟一次 SD 写盘之后。
+    //       把这两个读挪到 UI 之前，构造函数就只剩「纯 CPU 的视图树搭建」。
+    //       这里每一步都记结果，出问题能看出是哪一次 SD 访问。
+    //------------------------------------------------------------------
+    appcfg::UrlEntry urlEntry;
+    {
+        std::string urlText;
+        const bool read  = fsx::readWholeFile(appcfg::URL_FILE, &urlText);
+        const bool parse = read && appcfg::parseUrlFile(urlText, &urlEntry);
+
+        logx::linef("读 url.txt = %d（%u 字节），解析 = %d（updata=%d download=%d img=%u 项）",
+            read ? 1 : 0, static_cast<unsigned>(urlText.size()), parse ? 1 : 0,
+            urlEntry.update.empty() ? 0 : 1, urlEntry.download.empty() ? 0 : 1,
+            static_cast<unsigned>(urlEntry.images.size()));
+    }
+
+    std::string settingsText;
+    {
+        const bool read = fsx::readWholeFile(appcfg::SETTINGS_FILE, &settingsText);
+        logx::linef("读 settings.txt = %d（%u 字节）", read ? 1 : 0,
+            static_cast<unsigned>(settingsText.size()));
+    }
+
+    //------------------------------------------------------------------
     // 6. borealis
     //------------------------------------------------------------------
     brls::Logger::setLogLevel(brls::LogLevel::INFO);
@@ -203,6 +231,7 @@ int main(int argc, char* argv[])
 
     logx::line("Application::init = OK");
     logx::linef("环境：%s", netx::describe().c_str());
+    logx::linef("applet 状态：%s", netx::appletStateText().c_str());
 
     //------------------------------------------------------------------
     // 7. 中文字体：必须在 Application::init 之后（此时字体表与 nanovg 上下文才就绪）
@@ -242,7 +271,7 @@ int main(int argc, char* argv[])
     //    「构造」还是「首次布局」出的问题。
     //------------------------------------------------------------------
     logx::ui("准备 pushView 主界面");
-    brls::Application::pushView(new MainView(&g_downloader, notice));
+    brls::Application::pushView(new MainView(&g_downloader, notice, urlEntry, settingsText));
     logx::ui("pushView 已返回，进入主循环");
 
     while (brls::Application::mainLoop())
@@ -250,7 +279,7 @@ int main(int argc, char* argv[])
 
     //------------------------------------------------------------------
     // 10. 收尾顺序很重要：
-    //     先让下载线程退出（它还在用文件系统），再关文件系统 / 网络
+    //     先让下载线程退出（它还在用文件系统），再关日志、文件系统 / 网络
     //------------------------------------------------------------------
     logx::line("主循环退出，开始收尾");
 
@@ -258,6 +287,7 @@ int main(int argc, char* argv[])
     g_downloader.join();
 
     curl_global_cleanup();
+    logx::close(); // 日志句柄必须在 fsx::exit() 之前关掉
     fsx::exit();
     netx::exit();
     romfsExit();

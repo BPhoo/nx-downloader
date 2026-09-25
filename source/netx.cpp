@@ -102,6 +102,45 @@ std::string describe()
     return text;
 }
 
+std::string appletStateText()
+{
+    const AppletType type = appletGetAppletType();
+
+    const char* typeText = "应用模式";
+    if (type == AppletType_LibraryApplet)
+        typeText = "Applet（相册启动）";
+    else if (type == AppletType_SystemApplet)
+        typeText = "系统 Applet";
+    else if (type == AppletType_OverlayApplet)
+        typeText = "Overlay Applet";
+    else if (type == AppletType_Application)
+        typeText = "完整内存（游戏图标启动）";
+
+    // 焦点状态：失焦时系统会接管 SD 卡 / 显示，此时做 SD 读写是最危险的
+    const AppletFocusState focus  = appletGetFocusState();
+    const char* focusText         = "未知";
+    switch (focus)
+    {
+        case AppletFocusState_InFocus:
+            focusText = "InFocus";
+            break;
+        case AppletFocusState_OutOfFocus:
+            focusText = "OutOfFocus（有 LibraryApplet 在前台）";
+            break;
+        case AppletFocusState_Background:
+            focusText = "Background";
+            break;
+        default:
+            break;
+    }
+
+    const AppletOperationMode mode = appletGetOperationMode();
+
+    return std::string("appletType=") + std::to_string(static_cast<int>(type)) + "(" + typeText +
+           ")，焦点=" + focusText + "(" + std::to_string(static_cast<int>(focus)) + ")" +
+           "，屏幕=" + (mode == AppletOperationMode_Console ? "底座/TV" : "掌机");
+}
+
 bool init()
 {
     if (g_socketOk)

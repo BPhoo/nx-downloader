@@ -47,8 +47,17 @@ class RemoteImageView;
 class MainView : public brls::List
 {
   public:
-    /// startupNotice：启动阶段要告诉用户的事（网络失败 / 已生成 url.txt 等），显示在详情区
-    explicit MainView(Downloader* downloader, const std::string& startupNotice = "");
+    /// startupNotice：启动阶段要告诉用户的事（网络失败 / 已生成 url.txt 等），先存起来，
+    ///                等界面跑起来后再显示（构造函数里不碰界面文案以外的任何东西）
+    /// urlEntry：     已经由 main.cpp 读好的 url.txt 内容（updata / download / img）
+    /// settingsText： 已经由 main.cpp 读好的 settings.txt 原文（界面自己解析）
+    ///
+    /// ★ 为什么把 url.txt / settings.txt 的**读取**移到构造函数之外：
+    ///   Applet 模式（从相册启动）下 SD 卡是与父 applet / 系统共用的。真机日志显示
+    ///   崩溃点正好落在构造函数中间、紧跟在一次 SD 写盘之后；把构造函数里的
+    ///   所有 SD 访问拿掉之后，它只剩「纯 CPU 的视图树搭建」+ 逐行日志。
+    explicit MainView(Downloader* downloader, const std::string& startupNotice = "",
+        const appcfg::UrlEntry& urlEntry = appcfg::UrlEntry(), const std::string& settingsText = "");
     ~MainView() override;
 
     /// 轮询任务每 100ms 调用一次（始终在 UI 线程上）
@@ -83,7 +92,8 @@ class MainView : public brls::List
 
     void buildRows();
     void buildStatusArea();
-    void buildGallery();
+    /// 用 main.cpp 已经读好的 img: 列表建图片位（自己**不读 SD 卡**）
+    void buildGallery(const std::vector<std::string>& configured);
     void buildFooter(const std::string& startupNotice);
 
     void openTextFilePicker(bool forUpdate);
@@ -125,7 +135,8 @@ class MainView : public brls::List
     /// 任务进行期间每秒写一行日志，用来判断「渲染循环是否还活着」
     void heartbeat();
 
-    void readSettings();
+    /// 解析 settings.txt 原文（不读 SD 卡，内容由 main.cpp 读好传进来）
+    void readSettings(const std::string& text);
     void saveSettings() const;
 
     /// 从指定 txt 里取出对应字段填进该行输入框
@@ -162,6 +173,14 @@ class MainView : public brls::List
     /// 启动提示（构造函数只存起来，第一次轮询才显示）
     std::string startupNotice;
     bool noticeShown = false;
+
+    /// 正在把「上次保存的值」填进输入框 —— 这期间不要回写 settings.txt
+    /// （内容一样，白写一次 SD 卡；Applet 模式下 SD 卡 I/O 越少越安全）
+    bool applyingSaved = false;
+
+    /// 最近一次**真的写出去**的 settings.txt 内容；相同就不再写盘
+    /// （saveSettings() 是 const，所以这里必须 mutable）
+    mutable std::string lastSavedText;
 
     /// 页面出现后已经轮询了多少次（第一次轮询 ≈ 第一帧之后）
     int aliveTicks = 0;

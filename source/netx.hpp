@@ -50,4 +50,11 @@ bool fullMemoryMode();
 /// 一行环境描述（写日志 / 界面提示用）
 std::string describe();
 
+/// 一行 applet 状态描述：焦点状态 / 掌机·底座 / applet 类型。
+///
+/// 为什么要专门记它：Applet 模式（从相册启动）下，**失去焦点时系统会接管 SD 卡**，
+/// 此时若我们还在读写 SD 卡就可能互相干扰（真机现象是整机死机）。
+/// 把每一段关键操作前后的焦点状态记下来，就能判断卡死是不是发生在「失焦之后」。
+std::string appletStateText();
+
 } // namespace netx
